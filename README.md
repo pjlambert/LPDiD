@@ -21,7 +21,7 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/lpdid.git
+git clone https://github.com/pjlambert/LPDiD.git
 cd lpdid
 pip install -e .
 ```
@@ -41,7 +41,7 @@ pip install -e .
 
 ```python
 import pandas as pd
-from lpdid import LPDiD
+from LPDiD import LPDiD
 
 # Basic LP-DiD estimation
 lpdid = LPDiD(
