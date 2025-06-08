@@ -1,4 +1,4 @@
-# lpdid: Local Projections Difference-in-Differences for Python
+# LPDiD: Local Projections Difference-in-Differences for Python
 
 A Python implementation of the Local Projections Difference-in-Differences (LP-DiD) estimator proposed by Dube, Girardi, Jordà, and Taylor (2023).
 
@@ -16,6 +16,7 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 - **Reweighting options**: Variance-weighted or equally-weighted ATEs
 - **Pre-mean differencing**: Alternative baseline specifications
 - **Comprehensive diagnostics**: First-stage F-stats, weak IV tests, and more
+- **Sample Weights**: Permits sample weights to allow for matching/PSM/CEM
 
 ## Installation
 
