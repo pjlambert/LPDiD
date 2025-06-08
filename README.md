@@ -1,6 +1,6 @@
 # LPDiD: Local Projections Difference-in-Differences for Python
 
-A Python implementation of the Local Projections Difference-in-Differences (LP-DiD) estimator proposed by Dube, Girardi, Jordà, and Taylor (2023).
+A Python implementation of the Local Projections Difference-in-Differences (LP-DiD) estimator proposed by Dube, Girardi, Jordà, and Taylor (2023).  Developed by Peter John Lambert and Yannick Schindler.
 
 ## Features
 
