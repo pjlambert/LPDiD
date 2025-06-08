@@ -1,0 +1,51 @@
+.PHONY: help install install-dev test clean build upload docs
+
+help:
+	@echo "Available commands:"
+	@echo "  install      Install the package"
+	@echo "  install-dev  Install the package in development mode"
+	@echo "  test         Run unit tests"
+	@echo "  clean        Clean build artifacts"
+	@echo "  build        Build distribution packages"
+	@echo "  upload       Upload to PyPI (requires credentials)"
+	@echo "  docs         Generate documentation"
+
+install:
+	pip install .
+
+install-dev:
+	pip install -e .
+	pip install pytest pytest-cov black flake8
+
+test:
+	python -m pytest test_lpdid.py -v
+
+test-cov:
+	python -m pytest test_lpdid.py --cov=lpdid --cov-report=html
+
+lint:
+	flake8 lpdid.py wildboot_fallback.py utils.py
+	black --check lpdid.py wildboot_fallback.py utils.py
+
+format:
+	black lpdid.py wildboot_fallback.py utils.py
+
+clean:
+	rm -rf build/
+	rm -rf dist/
+	rm -rf *.egg-info
+	rm -rf __pycache__
+	rm -rf .pytest_cache
+	rm -rf htmlcov
+	rm -rf .coverage
+	find . -type d -name __pycache__ -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+
+build: clean
+	python setup.py sdist bdist_wheel
+
+upload: build
+	python -m twine upload dist/*
+
+docs:
+	@echo "Documentation is in README.md and example files"

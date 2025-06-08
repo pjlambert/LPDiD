@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include requirements.txt
+include PACKAGE_STRUCTURE.md
+include ENHANCEMENTS.md
+include FINAL_FEATURES.md
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .DS_Store

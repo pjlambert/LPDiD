@@ -1,0 +1,14 @@
+LICENSE.txt
+README.md
+pyproject.toml
+setup.py
+lpdid/__init__.py
+lpdid/lpdid.py
+lpdid/utils.py
+lpdid/wildboot_fallback.py
+lpdid.egg-info/PKG-INFO
+lpdid.egg-info/SOURCES.txt
+lpdid.egg-info/dependency_links.txt
+lpdid.egg-info/requires.txt
+lpdid.egg-info/top_level.txt
+tests/test_lpdid.py
