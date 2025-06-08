@@ -21,12 +21,6 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 ## Installation
 
 ```bash
-pip install lpdid
-```
-
-Or install from source:
-
-```bash
 git clone https://github.com/yourusername/lpdid.git
 cd lpdid
 pip install -e .
