@@ -131,5 +131,29 @@ def test_basic_lpdid():
     
     return results
 
+def main():
+    print("Testing LP-DiD Basic Functionality")
+    print("=" * 80)
+    
+    # Test 1: Basic functionality
+    print("Test 1: Basic LP-DiD functionality")
+    try:
+        results_basic = test_basic_lpdid()
+        print("\n✅ Basic functionality test completed successfully")
+    except Exception as e:
+        print(f"\n❌ Basic functionality test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    print("\n" + "="*80)
+    print("BASIC FUNCTIONALITY TEST SUMMARY")
+    print("="*80)
+    print("1. Basic LP-DiD functionality: ✅")
+    print("\nThe test verifies:")
+    print("- Coefficient estimation accuracy")
+    print("- Event study horizon coverage")
+    print("- Comparison with known true effects")
+
 if __name__ == "__main__":
-    test_basic_lpdid()
+    main()

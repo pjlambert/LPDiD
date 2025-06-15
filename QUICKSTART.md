@@ -48,6 +48,7 @@ results.summary()
 ## Common Use Cases
 
 ### 1. Simple DiD with Controls
+
 ```python
 lpdid = LPDiD(
     data=df,
@@ -62,26 +63,8 @@ lpdid = LPDiD(
 results = lpdid.fit()
 ```
 
-### 2. IV for Endogenous Treatment
-```python
-# When treatment might be endogenous
-lpdid_iv = LPDiD(
-    data=df,
-    depvar='employment',
-    unit='firm_id',
-    time='year',
-    treat='subsidy_received',
-    pre_window=3,
-    post_window=5,
-    formula="~ size | industry | D_treat ~ eligible + neighbor_treated"
-)
-results = lpdid_iv.fit()
+### 2. Heterogeneous Treatment Effects
 
-# Check if instruments are strong
-print(results.iv_diagnostics)  # Look for F-stat > 10
-```
-
-### 3. Heterogeneous Treatment Effects
 ```python
 # How do effects vary by firm characteristics?
 lpdid_het = LPDiD(
@@ -101,7 +84,8 @@ results = lpdid_het.fit()
 print(results.event_study[['horizon', 'coefficient', 'size_interaction']])
 ```
 
-### 4. Robust Standard Errors
+### 3. Robust Standard Errors
+
 ```python
 # Wild bootstrap for better inference
 lpdid_robust = LPDiD(
@@ -120,9 +104,82 @@ lpdid_robust = LPDiD(
 results = lpdid_robust.fit()
 ```
 
+### 4. Advanced Control Period Selection
+
+```python
+# Use minimum time controls for better comparability
+lpdid_min_controls = LPDiD(
+    data=df,
+    depvar='employment',
+    unit='firm_id',
+    time='year',
+    treat='policy_change',
+    pre_window=4,
+    post_window=6,
+    formula="~ size + industry_controls | region",
+    min_time_controls=True,  # Use min(t-1, t+h) for control periods
+    n_jobs=-1
+)
+results = lpdid_min_controls.fit()
+
+# Filter units based on status at control periods
+lpdid_selection = LPDiD(
+    data=df,
+    depvar='profits',
+    unit='firm_id',
+    time='year',
+    treat='regulation',
+    pre_window=3,
+    post_window=5,
+    formula="~ controls | industry",
+    min_time_selection='active==1',  # Only firms active at control period
+    n_jobs=-1
+)
+results = lpdid_selection.fit()
+
+# Swap pre-treatment difference direction
+lpdid_swap = LPDiD(
+    data=df,
+    depvar='wages',
+    unit='firm_id',
+    time='year',
+    treat='policy',
+    pre_window=4,
+    post_window=6,
+    formula="~ size + controls | industry",
+    swap_pre_diff=True,  # Use y_t-1 - y_t+h for pre-treatment periods
+    n_jobs=-1
+)
+results = lpdid_swap.fit()
+
+# Combine multiple advanced features
+lpdid_combined = LPDiD(
+    data=df,
+    depvar='revenue',
+    unit='firm_id',
+    time='year',
+    treat='treatment',
+    pre_window=4,
+    post_window=6,
+    formula="~ size + age | industry",
+    min_time_controls=True,
+    min_time_selection='operational==1',  # Custom boolean condition
+    swap_pre_diff=True,
+    n_jobs=-1
+)
+results = lpdid_combined.fit()
+```
+
+**When to use these features:**
+- `min_time_controls=True`: When you want more comparable control periods for long pre-treatment horizons
+- `min_time_selection`: When units may exit/enter the sample and you need them to satisfy conditions at control periods
+- `swap_pre_diff=True`: When you want to reverse the direction of pre-treatment differences (y_t-1 - y_t+h instead of y_t+h - y_t-1)
+- Common conditions: `'alive==1'`, `'employed==1'`, `'status>0'`, `'active==True'`
+
 ## Interpreting Results
 
 ### Event Study Output
+
 ```
 horizon  coefficient    se      p     ci_low   ci_high   obs
 -3       0.021        0.045   0.642  -0.067   0.109     1200
@@ -137,18 +194,8 @@ horizon  coefficient    se      p     ci_low   ci_high   obs
 - **Horizon -1**: Reference period (always zero)
 - **Post-treatment** (positive horizons): Treatment effects over time
 
-### IV Diagnostics
-```
-horizon  first_stage_F  weak_iv
-0        45.3          False
-1        43.7          False
-2        41.2          False
-```
-
-- **first_stage_F > 10**: Instruments are strong
-- **weak_iv = True**: Warning for weak instruments
-
 ### Heterogeneous Effects
+
 ```
 horizon  coefficient  size_interaction  size_interaction_p
 0        0.150       0.082            0.023
@@ -162,7 +209,7 @@ horizon  coefficient  size_interaction  size_interaction_p
 
 ## Tips
 
-1. **Start simple**: Run without IV/interactions first
+1. **Start simple**: Run without interactions first
 2. **Check pre-trends**: Look at negative horizons
 3. **Use parallel**: Set `n_jobs=-1` for speed
 4. **Bootstrap iterations**: Start with 499, increase for final results
@@ -174,11 +221,6 @@ horizon  coefficient  size_interaction  size_interaction_p
 - Check for sufficient variation in treatment
 - Ensure panel is balanced enough
 - Try fewer horizons or controls
-
-### Weak instruments (F < 10)
-- Find stronger instruments
-- Consider OLS as robustness check
-- Report both OLS and IV results
 
 ### Slow performance
 - Reduce horizons

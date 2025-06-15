@@ -2,14 +2,13 @@
 
 **NOTE:** This is still in the early building stages!
 
-A Python implementation of the Local Projections Difference-in-Differences (LP-DiD) estimator proposed by Dube, Girardi, Jordà, and Taylor (2023).  Developed by Peter John Lambert and Yannick Schindler.
+A Python implementation of the Local Projections Difference-in-Differences (LP-DiD) estimator proposed by Dube, Girardi, Jordà, and Taylor (2023). Developed by Peter John Lambert and Yannick Schindler.
 
 ## Features
 
 - **Binary treatment support**: Both absorbing and non-absorbing treatments
-- **Instrumental Variables**: Built-in IV support for endogenous treatment
-- **Treatment effect heterogeneity**: Interaction terms to explore effect variation
-- **Formula interface**: R-style formulas for controls, fixed effects, and IV
+- **Treatment effect heterogeneity**: Interaction terms to explore effect variation  
+- **Formula interface**: R-style formulas for controls and fixed effects
 - **Wild bootstrap inference**: Cluster-robust wild bootstrap standard errors
 - **Multi-way clustering**: Support for multiple clustering variables
 - **Flexible estimation**: Event study and pooled treatment effects
@@ -17,7 +16,6 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 - **Multiple control groups**: Never-treated, not-yet-treated, or clean controls
 - **Reweighting options**: Variance-weighted or equally-weighted ATEs
 - **Pre-mean differencing**: Alternative baseline specifications
-- **Comprehensive diagnostics**: First-stage F-stats, weak IV tests, and more
 - **Sample Weights**: Permits sample weights to allow for matching/PSM/CEM
 
 ## Installation
@@ -71,32 +69,6 @@ results.summary()
 
 ## Advanced Usage
 
-### Instrumental Variables
-
-For endogenous treatment, use the three-part formula syntax:
-
-```python
-# IV specification
-lpdid_iv = LPDiD(
-    data=data,
-    depvar='y',
-    unit='unit',
-    time='time',
-    treat='treat',
-    pre_window=5,
-    post_window=10,
-    formula="~ controls | fixed_effects | D_treat ~ instrument1 + instrument2",
-    wildbootstrap=999,
-    n_jobs=-1
-)
-
-results = lpdid_iv.fit()
-
-# Check IV diagnostics
-print(results.iv_diagnostics)  # First-stage F-statistics
-print(results.first_stage)      # First-stage coefficients
-```
-
 ### Treatment Effect Heterogeneity
 
 Explore how treatment effects vary with observable characteristics:
@@ -137,32 +109,9 @@ event_study = results.event_study
 print(event_study[['horizon', 'coefficient', 'size_interaction', 'size_interaction_se']])
 ```
 
-### IV with Heterogeneous Effects
-
-Combine IV and interactions:
-
-```python
-lpdid_iv_het = LPDiD(
-    data=data,
-    depvar='y',
-    unit='unit',
-    time='time',
-    treat='treat',
-    pre_window=5,
-    post_window=10,
-    formula="~ controls | FE | D_treat ~ instruments",
-    interactions="~ size + i.industry",
-    wildbootstrap=999,
-    n_jobs=-1
-)
-
-results = lpdid_iv_het.fit()
-results.summary()  # Comprehensive output including all diagnostics
-```
-
 ### Formula Interface
 
-The package supports R-style formulas with three parts:
+The package supports R-style formulas:
 
 ```python
 # Basic formula
@@ -170,9 +119,6 @@ formula="~ control1 + control2"  # Only controls
 
 # With fixed effects
 formula="~ control1 + control2 | fe1 + fe2"  # Controls and FEs
-
-# With IV
-formula="~ controls | FE | endog ~ instruments"  # Full specification
 
 # Factor variables (categorical)
 formula="~ x1 + i.category | FE"  # i.category creates dummies
@@ -306,6 +252,76 @@ lpdid_pmd = LPDiD(
 )
 ```
 
+### Control Period Selection
+
+The package provides advanced options for selecting control periods in long differences:
+
+```python
+# Use minimum time controls for more comparable control periods
+lpdid_min_controls = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    min_time_controls=True,  # Use min(t-1, t+h) for control periods
+    n_jobs=-1
+)
+
+# Filter units based on conditions at control periods
+lpdid_selection = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    min_time_selection='alive==1',  # Only include units alive at control period
+    n_jobs=-1
+)
+
+# Swap pre-treatment difference direction
+lpdid_swap = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    swap_pre_diff=True,  # Use y_t-1 - y_t+h instead of y_t+h - y_t-1 for pre-treatment
+    n_jobs=-1
+)
+
+# Combine multiple features
+lpdid_combined = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    min_time_controls=True,
+    min_time_selection='status>0',  # Custom boolean condition
+    swap_pre_diff=True,
+    n_jobs=-1
+)
+```
+
+**Control Period Logic:**
+- `min_time_controls=True`: For pre-treatment periods, uses `min(t-1, t+h)` as control
+- `min_time_selection`: Filters units based on boolean condition at the control period
+- `swap_pre_diff=True`: For pre-treatment periods, computes `y_t-1 - y_t+h` instead of `y_t+h - y_t-1`
+- Supports conditions like `'alive==1'`, `'status>0'`, `'employed==True'`
+
 ## Main Parameters
 
 - `data`: Panel DataFrame
@@ -315,7 +331,7 @@ lpdid_pmd = LPDiD(
 - `treat`: Binary treatment indicator
 - `pre_window`: Pre-treatment periods to estimate (≥2)
 - `post_window`: Post-treatment periods to estimate (≥0)
-- `formula`: R-style formula for controls, fixed effects, and IV
+- `formula`: R-style formula for controls and fixed effects
 - `interactions`: Variables to interact with treatment
 - `cluster_formula`: R-style formula for clustering variables
 - `ylags`: Number of outcome lags to include
@@ -325,6 +341,8 @@ lpdid_pmd = LPDiD(
 - `nocomp`: Avoid composition changes
 - `rw`: Reweight for equally-weighted ATE
 - `pmd`: Pre-mean differencing specification
+- `min_time_controls`: Use min(t-1, t+h) for control periods (default: False)
+- `min_time_selection`: Boolean condition for unit inclusion at control periods
 - `wildbootstrap`: Number of wild bootstrap iterations
 - `weights`: Weight variable
 - `n_jobs`: Number of parallel jobs
@@ -336,8 +354,6 @@ The `fit()` method returns a `LPDiDResults` object containing:
 - `event_study`: DataFrame with period-by-period treatment effects
   - Includes main effects and interaction terms if specified
 - `pooled`: DataFrame with averaged pre/post effects
-- `iv_diagnostics`: DataFrame with first-stage F-statistics and weak IV indicators
-- `first_stage`: DataFrame with first-stage regression coefficients
 - `summary()`: Method to print comprehensive results
 
 Each results DataFrame includes:
@@ -348,7 +364,6 @@ Each results DataFrame includes:
 - `ci_low`, `ci_high`: Confidence interval
 - `obs`: Number of observations
 - Interaction coefficients and their SEs (if interactions specified)
-- IV diagnostics (if IV specified)
 
 ## Interpreting Results
 
@@ -360,16 +375,12 @@ Each results DataFrame includes:
 - `var_interaction`: How effect changes with the variable
 - Total effect = `coefficient + Σ(interaction_coef × var_value)`
 
-### With IV
-- `coefficient`: Local average treatment effect (LATE) for compliers
-- Check `first_stage_F > 10` to avoid weak instruments
-- `iv_diagnostics` provides diagnostic information
-
 ## Citation
 
 If you use this package, please cite:
 
 Dube, A., D. Girardi, Ò. Jordà and A. M. Taylor. 2023. "A Local Projections Approach to Difference-in-Differences." NBER Working Paper 31184.
+
 Maintained by Peter John Lambert (p.j.lambert@lse.ac.uk).
 
 ## License
