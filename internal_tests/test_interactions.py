@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
-import sys
-import os
-sys.path.append('/Users/pjl/Dropbox/LPDiD')
-
 import numpy as np
 import pandas as pd
-from lpdid import LPDiD
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from LPDiD import LPDiD
 
 # Generate test data with interaction effects
 def create_interaction_test_data():

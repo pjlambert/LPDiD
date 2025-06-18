@@ -4,14 +4,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="lpdid",
+    name="LPDiD",
     version="0.1.0",
     author="Peter John Lambert",
     author_email="p.j.lambert@lse.ac.uk",
     description="Local Projections Difference-in-Differences (LP-DiD) for Python",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/lpdid",
+    url="https://github.com/yourusername/LPDiD",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

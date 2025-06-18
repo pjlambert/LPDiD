@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from lpdid import LPDiD
+from LPDiD import LPDiD
 
 def test_min_time_selection_independence():
     """Test that min_time_selection works independently of min_time_controls"""

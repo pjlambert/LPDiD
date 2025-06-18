@@ -183,58 +183,54 @@ def parse_cluster_formula(formula: str) -> List[str]:
 
 class LPDiD:
     """
-    Local Projections Difference-in-Differences Estimator
-    
+    Implements the Local Projections Difference-in-Differences (LP-DiD) estimator
+    from Dube, Girardi, Jordà, and Taylor (2023).
+
+    This class provides a flexible interface to estimate event-study-style
+    treatment effects using a panel dataset.
+
     Parameters
     ----------
     data : pd.DataFrame
-        Panel data
+        The panel dataset for analysis. Must be in long format.
     depvar : str
-        Dependent variable name
+        The name of the dependent variable column.
     unit : str
-        Unit identifier variable
+        The name of the unit (e.g., individual, firm) identifier column.
     time : str
-        Time variable
+        The name of the time period identifier column.
     treat : str
-        Binary treatment indicator
+        The name of the binary treatment indicator column (0 or 1).
     pre_window : int, optional
-        Pre-treatment periods (>=2)
+        The number of pre-treatment periods to estimate effects for. Must be >= 2.
+        Defaults to 2 if not specified.
     post_window : int, optional
-        Post-treatment periods (>=0)
+        The number of post-treatment periods to estimate effects for. Must be >= 0.
+        Defaults to 0 if not specified.
     formula : str, optional
-        Formula for controls and fixed effects like "~ controls | FE"
+        A formula string to specify control variables and fixed effects,
+        e.g., "~ x1 + x2 | fe1 + fe2".
     interactions : str, optional
-        Variables to interact with treatment like "~ var1 + var2"
+        A formula-like string to specify variables that interact with the treatment
+        indicator, e.g., "~ group_var". This allows for estimating heterogeneous effects.
     cluster_formula : str, optional
-        Formula for clustering like "~ cluster1 + cluster2"
+        A formula-like string to specify clustering variables, e.g., "~ cluster_var".
+        Defaults to clustering by the `unit` identifier.
     ylags : int, optional
-        Number of outcome lags to include
+        The number of lags of the dependent variable to include as controls.
     dylags : int, optional
-        Number of first-differenced outcome lags to include
-    nonabsorbing : tuple, optional
-        (L, notyet, firsttreat) for non-absorbing treatment
+        The number of lags of the first-differenced dependent variable to include as controls.
     nevertreated : bool, default False
-        Use only never-treated as controls
-    nocomp : bool, default False
-        Rule out composition changes
-    rw : bool, default False
-        Reweight for equally-weighted ATE
-    pmd : Union[int, str], optional
-        Pre-mean differencing specification
-    min_time_controls : bool, default False
-        Use min(t-1, t+h) for control periods in pre-treatment and t-1 for post-treatment
-    min_time_selection : str, optional
-        Boolean condition that must be true at min(t-1, t+h) for unit inclusion (e.g., 'alive==1')
-    swap_pre_diff : bool, default False
-        For pre-treatment periods, use y_t-1 - y_t+h instead of y_t+h - y_t-1
+        If True, uses only never-treated units as the control group.
     wildbootstrap : int, optional
-        Wild bootstrap iterations
+        The number of iterations for wild bootstrap inference. If None, analytical
+        standard errors are used.
     seed : int, optional
-        Random seed
+        A random seed for reproducibility, particularly for wild bootstrap.
     weights : str, optional
-        Weight variable
+        The name of a column to be used as regression weights.
     n_jobs : int, default 1
-        Number of parallel jobs (-1 for all cores)
+        The number of CPU cores to use for parallel processing. -1 uses all available cores.
     """
     
     def __init__(self, 
@@ -670,8 +666,28 @@ class LPDiD:
         return reg_data
 
     def _run_single_regression(self, horizon, is_pre=False):
-        """Run a single LP-DiD regression"""
-        # Determine variables
+        """
+        Run a single local projection regression for a specific horizon.
+
+        This internal method is the core of the estimation. It constructs the
+        appropriate dependent variable for the given horizon, filters the data
+        to the correct sample, builds the regression formula, and runs the
+        estimation using `pyfixest`.
+
+        Parameters
+        ----------
+        horizon : int
+            The event time horizon for which to run the regression.
+        is_pre : bool, default False
+            A flag indicating whether the horizon is in the pre-treatment period.
+
+        Returns
+        -------
+        dict or None
+            A dictionary containing the regression results (coefficient, se, etc.)
+            for the specified horizon, or None if the regression fails.
+        """
+        # Determine dependent variable, clean control sample, and weight variables based on horizon
         if is_pre:
             y_var = f'Dm{horizon}y'
             ccs_var = f'CCS_m{horizon}'
@@ -717,18 +733,18 @@ class LPDiD:
         else:
             use_weights = None
         
-        # Run regression
+        # Run the fixed-effects regression using pyfixest.
         try:
             if use_weights is not None:
                 fit = pf.feols(
-                    formula, 
-                    data=reg_data, 
+                    formula,
+                    data=reg_data,
                     weights=use_weights,
                     vcov=vcov
                 )
             else:
                 fit = pf.feols(
-                    formula, 
+                    formula,
                     data=reg_data,
                     vcov=vcov
                 )
@@ -873,47 +889,72 @@ class LPDiD:
 
     def fit(self):
         """
-        Fit the LP-DiD model
-        
+        Fit the Local Projections Difference-in-Differences (LP-DiD) model.
+
+        This method executes the full LP-DiD estimation pipeline:
+        1. Identifies clean control units that are never treated.
+        2. Constructs long-differenced outcomes for each horizon.
+        3. Computes weights for the regression if specified.
+        4. Runs separate regressions for each pre- and post-treatment horizon.
+        5. Collates the results into an `LPDiDResults` object.
+
         Returns
         -------
         LPDiDResults
-            Results object containing event study and pooled estimates
+            An object containing the estimated event-study coefficients and other relevant information.
         """
-        # Identify clean control samples
+        # Step 1: Identify units that are never treated to serve as clean controls.
         self._identify_clean_controls()
         
-        # Generate long differences
+        # Step 2: Create the long-differenced outcome variable for each horizon.
         self._generate_long_differences()
         
-        # Compute weights if needed
+        # Step 3: Compute regression weights if a weighting variable is specified.
         self._compute_weights()
         
-        # Run event study regressions
+        # Step 4: Run event-study regressions for each specified horizon.
         event_study_results = []
         
-        # Pre-treatment regressions
+        # Run regressions for each pre-treatment period (h=2 to pre_window).
+        # h=1 is the period just before treatment, which is normalized to 0 and omitted here.
         for h in range(2, self.pre_window + 1):
             result = self._run_single_regression(h, is_pre=True)
             if result:
                 event_study_results.append(result)
         
-        # Post-treatment regressions  
+        # Run regressions for each post-treatment period (h=0 to post_window).
+        # h=0 is the treatment period itself.
         for h in range(self.post_window + 1):
             result = self._run_single_regression(h, is_pre=False)
             if result:
                 event_study_results.append(result)
         
-        # Convert to DataFrame
+        # Step 5: Collate results into a structured DataFrame.
         if event_study_results:
             event_study_df = pd.DataFrame(event_study_results)
-            # Sort by horizon
-            event_study_df = event_study_df.sort_values('horizon').reset_index(drop=True)
         else:
-            # Create empty DataFrame with expected columns
+            # If no regressions were successful, create an empty DataFrame with the expected structure.
             event_study_df = pd.DataFrame(columns=['horizon', 'coefficient', 'se', 't', 'p', 'ci_low', 'ci_high', 'obs'])
+
+        # Normalize the event-study plot by setting the coefficient for h=-1 to 0.
+        # This is a standard convention to show treatment effects relative to the period just before treatment.
+        # For this period, all other metrics (se, t, etc.) are also set to 0 for consistency.
+        if -1 not in event_study_df['horizon'].values:
+            # Dynamically create the row with all zeros to handle any extra columns from interactions.
+            cols = event_study_df.columns
+            if len(cols) == 0:
+                # Fallback if there were no other results from the regressions.
+                cols = ['horizon', 'coefficient', 'se', 't', 'p', 'ci_low', 'ci_high', 'obs']
+            
+            h_minus_1_row = {col: 0.0 for col in cols}
+            h_minus_1_row['horizon'] = -1
+            
+            event_study_df = pd.concat([pd.DataFrame([h_minus_1_row]), event_study_df], ignore_index=True)
+
+        # Sort results by horizon for chronological plotting and analysis.
+        event_study_df = event_study_df.sort_values('horizon').reset_index(drop=True)
         
-        # Create results object
+        # Step 6: Package the results into a dedicated LPDiDResults object for easy access and plotting.
         results = LPDiDResults(
             event_study=event_study_df,
             depvar=self.depvar,

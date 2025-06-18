@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from lpdid import LPDiDPois
+from LPDiD import LPDiDPois
 
 def create_survival_test_data():
     """Create test data with binary death outcomes and treatment effects on hazard rates"""
@@ -158,7 +158,7 @@ def test_lpdid_poisson():
     print("="*60)
     
     # Try regular LP-DiD with simpler specification
-    from lpdid import LPDiD
+    from LPDiD import LPDiD
     
     try:
         lpdid_ols = LPDiD(

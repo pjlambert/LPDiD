@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from lpdid import LPDiD
+from LPDiD import LPDiD
 
 def create_simple_test_data():
     np.random.seed(123)

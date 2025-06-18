@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
-import sys
-import os
-sys.path.append('/Users/pjl/Dropbox/lpdid')
-
 import numpy as np
 import pandas as pd
-from lpdid import LPDiD
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from LPDiD import LPDiD
 import time
 
 def create_wild_bootstrap_test_data():
