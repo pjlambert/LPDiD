@@ -10,11 +10,10 @@ readme = "README.md"
 authors = [
     {name = "Peter John Lambert", email = "p.j.lambert@lse.ac.uk"}
 ]
-license = {text = "MIT"}
+license = "MIT"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",

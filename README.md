@@ -22,7 +22,7 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 
 ```bash
 git clone https://github.com/pjlambert/LPDiD.git
-cd lpdid
+cd LPDiD
 pip install -e .
 ```
 
