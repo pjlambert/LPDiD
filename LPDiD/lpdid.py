@@ -31,39 +31,22 @@ import warnings
 warnings.filterwarnings("ignore", message=".*omp_set_nested.*")
 warnings.filterwarnings("ignore", message=".*OMP.*")
 warnings.filterwarnings("ignore", message=".*A worker stopped while some jobs were given to the executor.*")
+# Suppress Polars fork warnings
+warnings.filterwarnings("ignore", message=".*fork.*")
+warnings.filterwarnings("ignore", message=".*Polars.*fork.*")
+warnings.filterwarnings("ignore", message=".*using fork.*")
+
+# Set environment variable to disable Polars fork warnings
+if 'POLARS_WARN_UNSTABLE_FORK' not in os.environ:
+    os.environ['POLARS_WARN_UNSTABLE_FORK'] = '0'
 
 import sys
 import platform
 import multiprocessing
 
-# Fix for Polars fork() warning on Linux and other platforms
-# Setting to 'spawn' prevents the fork() usage that triggers the warning
-# This is especially important on Linux where fork is the default
-try:
-    current_method = multiprocessing.get_start_method(allow_none=True)
-    if current_method is None or (platform.system() == 'Linux' and current_method == 'fork'):
-        multiprocessing.set_start_method('spawn', force=True)
-        
-        # Also configure joblib to use spawn
-        try:
-            import joblib
-            # Configure joblib's multiprocessing backend to use spawn
-            if hasattr(joblib.parallel, 'BACKENDS'):
-                if 'multiprocessing' in joblib.parallel.BACKENDS:
-                    joblib.parallel.BACKENDS['multiprocessing'].start_method = 'spawn'
-        except Exception:
-            pass  # joblib configuration is optional
-            
-except RuntimeError as e:
-    # start_method may have already been set by another module
-    current_method = multiprocessing.get_start_method()
-    if platform.system() == 'Linux' and current_method != 'spawn':
-        warnings.warn(
-            f"Multiprocessing start method is already set to '{current_method}'. "
-            f"To avoid Polars fork() warnings on Linux, it's recommended to use 'spawn'. "
-            f"Set this before importing LPDiD: multiprocessing.set_start_method('spawn', force=True)",
-            UserWarning
-        )
+# Note: We do NOT force multiprocessing configuration at module import time
+# This avoids conflicts with other packages and user configurations
+# Instead, configuration happens within the LPDiD class when mp_type is specified
 
 import numpy as np
 import pandas as pd
@@ -398,6 +381,21 @@ class LPDiD:
     def _configure_multiprocessing(self):
         """Configure multiprocessing start method based on mp_type parameter"""
         if self.mp_type is None:
+            # Auto-detect and recommend spawn on Linux for memory efficiency
+            if platform.system() == 'Linux' and self.n_jobs != 1:
+                try:
+                    current_method = multiprocessing.get_start_method(allow_none=True)
+                    if current_method == 'fork':
+                        warnings.warn(
+                            "You are using parallel processing on Linux with 'fork' method. "
+                            "For better memory efficiency and to avoid warnings, consider setting mp_type='spawn' "
+                            "when creating LPDiD instance, or use:\n"
+                            "  from LPDiD.spawn_enforcer import configure_for_memory_efficiency\n"
+                            "  configure_for_memory_efficiency()",
+                            UserWarning
+                        )
+                except:
+                    pass
             return  # Use system default
         
         # Validate mp_type
@@ -409,35 +407,68 @@ class LPDiD:
         if self.mp_type == 'forkserver' and platform.system() == 'Windows':
             raise ValueError("forkserver mp_type is not supported on Windows")
         
+        # Only attempt to configure if we're actually going to use parallel processing
+        if self.n_jobs == 1:
+            return  # No need to configure for sequential processing
+        
+        # Be more aggressive about setting spawn for memory efficiency
+        success = self._force_multiprocessing_method(self.mp_type)
+        
+        if not success and self.mp_type == 'spawn':
+            print("⚠ Warning: Could not set spawn method. For better memory efficiency:")
+            print("  1. Restart your Python session")
+            print("  2. Set spawn before importing any libraries:")
+            print("     import multiprocessing")
+            print("     multiprocessing.set_start_method('spawn', force=True)")
+            print("  3. Or use: from LPDiD.spawn_enforcer import configure_for_memory_efficiency")
+    
+    def _force_multiprocessing_method(self, method):
+        """Aggressively try to set multiprocessing method"""
         try:
-            # Get current method to check if it's already set
             current_method = multiprocessing.get_start_method(allow_none=True)
+            
+            if current_method == method:
+                if method == 'spawn':
+                    print("✓ Spawn multiprocessing already configured for memory efficiency")
+                return True
             
             if current_method is None:
                 # No method set yet, safe to set
-                multiprocessing.set_start_method(self.mp_type)
-                print(f"Set multiprocessing start method to '{self.mp_type}'")
-            elif current_method != self.mp_type:
-                # Different method already set, try force setting
-                try:
-                    multiprocessing.set_start_method(self.mp_type, force=True)
-                    print(f"Changed multiprocessing start method from '{current_method}' to '{self.mp_type}'")
-                except RuntimeError as e:
-                    warnings.warn(
-                        f"Could not change multiprocessing start method from '{current_method}' to '{self.mp_type}': {e}. "
-                        f"Using '{current_method}' instead.",
-                        UserWarning
-                    )
+                multiprocessing.set_start_method(method)
+                if method == 'spawn':
+                    print("✓ Successfully configured spawn multiprocessing for memory efficiency")
+                return True
             else:
-                # Same method already set, no action needed
-                print(f"Multiprocessing start method already set to '{self.mp_type}'")
+                # Try to force the method
+                try:
+                    multiprocessing.set_start_method(method, force=True)
+                    if method == 'spawn':
+                        print("✓ Successfully forced spawn multiprocessing for memory efficiency")
+                    return True
+                except RuntimeError:
+                    # Method already set and can't be changed in this session
+                    if method == 'spawn' and current_method == 'fork':
+                        warnings.warn(
+                            f"Cannot change from '{current_method}' to '{method}' in current session. "
+                            f"Restart Python and set spawn before importing libraries for memory efficiency.",
+                            UserWarning
+                        )
+                    return False
                 
         except Exception as e:
-            warnings.warn(
-                f"Failed to configure multiprocessing start method '{self.mp_type}': {e}. "
-                "Using system default.",
-                UserWarning
-            )
+            warnings.warn(f"Error configuring {method} multiprocessing: {e}")
+            return False
+    
+    def _get_optimal_joblib_backend(self):
+        """Get the optimal joblib backend based on multiprocessing configuration"""
+        current_method = multiprocessing.get_start_method(allow_none=True)
+        
+        if current_method == 'spawn':
+            # With spawn, we can use multiprocessing backend for better integration
+            return 'multiprocessing'
+        else:
+            # With fork or unset, use loky which manages its own processes
+            return 'loky'
 
     def _validate_inputs(self):
         """Validate input parameters"""
@@ -1284,24 +1315,54 @@ class LPDiD:
         if n_cores > 1 and len(regression_tasks) > 1:
             print(f"Running regressions in parallel using {n_cores} cores...")
             
-            # Set up parallel processing with appropriate backend for each OS
-            if platform.system() == 'Windows':
-                # Windows requires 'loky' backend for multiprocessing
-                backend = 'loky'
-            else:
-                # Unix-based systems (Mac, Linux) can use 'loky' or 'multiprocessing'
-                backend = 'loky'  # loky is more robust across platforms
+            # Use optimal backend based on multiprocessing configuration
+            backend = self._get_optimal_joblib_backend()
+            current_mp_method = multiprocessing.get_start_method()
             
-            with Parallel(n_jobs=n_cores, backend=backend, verbose=0, timeout=300, max_nbytes='50M') as parallel:
-                # Run regressions in parallel with progress indicator
-                results = parallel(
-                    delayed(self._run_single_regression)(h, is_pre) 
-                    for h, is_pre in regression_tasks
-                )
+            print(f"Using joblib backend: {backend} (multiprocessing method: {current_mp_method})")
+            
+            # Adjust settings based on backend
+            if backend == 'multiprocessing' and current_mp_method == 'spawn':
+                # With spawn, we get better memory isolation but need larger max_nbytes
+                n_observations = len(self.data)
+                max_nbytes = '2G' if n_observations > 1_000_000 else '500M'
+                timeout = 900  # Longer timeout for spawn (slower startup)
+            else:
+                # With loky or fork, use standard settings
+                n_observations = len(self.data)
+                max_nbytes = '1G' if n_observations > 1_000_000 else '100M'
+                timeout = 600
+            
+            try:
+                with Parallel(n_jobs=n_cores, backend=backend, verbose=0, timeout=timeout, max_nbytes=max_nbytes) as parallel:
+                    # Run regressions in parallel with progress indicator
+                    results = parallel(
+                        delayed(self._run_single_regression)(h, is_pre) 
+                        for h, is_pre in regression_tasks
+                    )
+                    
+                # Filter out None results
+                event_study_results = [r for r in results if r is not None]
                 
-            # Filter out None results
-            event_study_results = [r for r in results if r is not None]
-            print(f"Parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+                if backend == 'multiprocessing' and current_mp_method == 'spawn':
+                    print(f"✓ Memory-efficient parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+                else:
+                    print(f"Parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+                
+            except (TerminatedWorkerError, MemoryError) as e:
+                print(f"\nParallel processing failed: {type(e).__name__}")
+                print("Falling back to sequential processing...")
+                print("Consider reducing n_jobs or using a machine with more memory.")
+                
+                # Fall back to sequential processing
+                event_study_results = []
+                for i, (h, is_pre) in enumerate(regression_tasks):
+                    print(f"  Progress: {i+1}/{len(regression_tasks)} - Horizon {-h if is_pre else h}...", end='\r')
+                    result = self._run_single_regression(h, is_pre)
+                    if result:
+                        event_study_results.append(result)
+                
+                print(f"\nSequential estimation complete. Successfully estimated {len(event_study_results)} horizons.")
             
         else:
             # Sequential execution
