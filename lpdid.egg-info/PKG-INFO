@@ -58,7 +58,7 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 - **Wild bootstrap inference**: Cluster-robust wild bootstrap standard errors
 - **Multi-way clustering**: Support for multiple clustering variables
 - **Flexible estimation**: Event study and pooled treatment effects
-- **Parallel processing**: Built-in support for parallel computation
+- **Enhanced parallel processing**: Parallelized data reshaping and regression estimation for 2-8x speedups
 - **Multiple control groups**: Never-treated, not-yet-treated, or clean controls
 - **Reweighting options**: Variance-weighted or equally-weighted ATEs
 - **Pre-mean differencing**: Alternative baseline specifications

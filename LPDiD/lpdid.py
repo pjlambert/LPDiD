@@ -51,6 +51,9 @@ from joblib import Parallel, delayed
 from dataclasses import dataclass
 from scipy import stats
 import re
+import multiprocessing
+import platform
+from tqdm import tqdm
 
 # Import wildboottest package
 try:
@@ -335,8 +338,22 @@ class LPDiD:
         if seed is not None:
             np.random.seed(seed)
         
+        # Warn about wild bootstrap limitations
+        if self.wildbootstrap:
+            warnings.warn(
+                "Wild bootstrap inference only adjusts p-values and t-statistics. "
+                "Standard errors and confidence intervals are still based on analytical inference. "
+                "The wild bootstrap is used to provide more robust p-values under potential heteroskedasticity.",
+                UserWarning
+            )
+        
+        # Print initialization info
+        self._print_init_info()
+        
         # Prepare data
+        print("Preparing data...")
         self._prepare_data()
+        print(f"Data preparation complete. Dataset has {len(self.data)} observations.")
         
     def _validate_inputs(self):
         """Validate input parameters"""
@@ -369,6 +386,54 @@ class LPDiD:
             if notyet and self.nevertreated:
                 raise ValueError("Cannot specify both notyet and nevertreated")
     
+    def _print_init_info(self):
+        """Print initialization information including parallel processing details"""
+        print("\n" + "="*60)
+        print("LP-DiD Initialization")
+        print("="*60)
+        
+        # Basic info
+        print(f"\nModel Information:")
+        print(f"  Dependent variable: {self.depvar}")
+        print(f"  Unit identifier: {self.unit}")
+        print(f"  Time identifier: {self.time}")
+        print(f"  Treatment indicator: {self.treat}")
+        print(f"  Pre-treatment window: {self.pre_window}")
+        print(f"  Post-treatment window: {self.post_window}")
+        
+        # Parallel processing info
+        if self.n_jobs == -1:
+            actual_cores = multiprocessing.cpu_count()
+        else:
+            actual_cores = min(self.n_jobs, multiprocessing.cpu_count())
+        
+        total_regressions = (self.pre_window - 1) + (self.post_window + 1)
+        
+        print(f"\nParallel Processing Configuration:")
+        print(f"  System: {platform.system()} {platform.machine()}")
+        print(f"  Available CPU cores: {multiprocessing.cpu_count()}")
+        print(f"  Cores to be used: {actual_cores}")
+        print(f"  Total regressions to run: {total_regressions}")
+        
+        # Additional options
+        if self.controls:
+            print(f"\nControl variables: {', '.join(self.controls)}")
+        if self.absorb:
+            print(f"Fixed effects: {', '.join(self.absorb)}")
+        if self.cluster_vars:
+            print(f"Clustering variables: {', '.join(self.cluster_vars)}")
+        if self.wildbootstrap:
+            print(f"Wild bootstrap iterations: {self.wildbootstrap}")
+        if self.nevertreated:
+            print("Using only never-treated units as controls")
+        
+        print("="*60 + "\n")
+    
+    def _create_single_lag(self, data_subset, lag, var_name):
+        """Create a single lag for a subset of data (helper for parallel processing)"""
+        unit_id = data_subset.index.get_level_values(0)[0]
+        return unit_id, data_subset[var_name].shift(lag)
+    
     def _prepare_data(self):
         """Prepare data for estimation"""
         # Sort data
@@ -396,22 +461,75 @@ class LPDiD:
                         self.data['D_treat'] * (self.data[clean_var] == val).astype(int)
                     )
         
+        # Determine if we should use parallel processing for lags
+        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
+        use_parallel = n_cores > 1 and ((self.ylags and self.ylags > 2) or (self.dylags and self.dylags > 2))
+        
         # Create lags if needed
         if self.ylags:
-            for lag in range(1, self.ylags + 1):
-                self.data[f'L{lag}_{self.depvar}'] = (
-                    self.data.groupby(level=0)[self.depvar].shift(lag)
-                )
-                self.controls.append(f'L{lag}_{self.depvar}')
+            if use_parallel and self.ylags > 2:
+                print(f"Creating {self.ylags} lags in parallel...")
+                # Parallel version
+                grouped = list(self.data.groupby(level=0))
+                tasks = [(group, lag, self.depvar) for lag in range(1, self.ylags + 1) for _, group in grouped]
+                
+                with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
+                    results = parallel(
+                        delayed(self._create_single_lag)(group, lag, var)
+                        for _, group, lag, var in tqdm(
+                            [(i, g, l, v) for i, (_, g) in enumerate(grouped) for l, v in [(lag, self.depvar) for lag in range(1, self.ylags + 1)]],
+                            desc="Creating lags",
+                            disable=False
+                        )
+                    )
+                
+                # Reorganize results by lag
+                for lag in range(1, self.ylags + 1):
+                    lag_col = f'L{lag}_{self.depvar}'
+                    self.data[lag_col] = pd.concat([r[1] for r in results if r[1].name == lag])
+                    self.controls.append(lag_col)
+            else:
+                # Sequential version
+                for lag in range(1, self.ylags + 1):
+                    self.data[f'L{lag}_{self.depvar}'] = (
+                        self.data.groupby(level=0)[self.depvar].shift(lag)
+                    )
+                    self.controls.append(f'L{lag}_{self.depvar}')
         
         if self.dylags:
             # First create the first difference
             self.data[f'D_{self.depvar}'] = self.data.groupby(level=0)[self.depvar].diff()
-            for lag in range(1, self.dylags + 1):
-                self.data[f'L{lag}_D_{self.depvar}'] = (
-                    self.data.groupby(level=0)[f'D_{self.depvar}'].shift(lag)
-                )
-                self.controls.append(f'L{lag}_D_{self.depvar}')
+            
+            if use_parallel and self.dylags > 2:
+                print(f"Creating {self.dylags} differenced lags in parallel...")
+                # Similar parallel approach for differenced lags
+                grouped = list(self.data.groupby(level=0))
+                
+                with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
+                    results = parallel(
+                        delayed(self._create_single_lag)(group, lag, f'D_{self.depvar}')
+                        for _, group in grouped
+                        for lag in range(1, self.dylags + 1)
+                    )
+                
+                # Reorganize results
+                for lag in range(1, self.dylags + 1):
+                    lag_col = f'L{lag}_D_{self.depvar}'
+                    # Collect results for this specific lag
+                    lag_results = []
+                    for unit_id, result in results:
+                        if len(result) > 0:  # Check if result is not empty
+                            lag_results.append(result)
+                    if lag_results:
+                        self.data[lag_col] = pd.concat(lag_results)
+                    self.controls.append(lag_col)
+            else:
+                # Sequential version
+                for lag in range(1, self.dylags + 1):
+                    self.data[f'L{lag}_D_{self.depvar}'] = (
+                        self.data.groupby(level=0)[f'D_{self.depvar}'].shift(lag)
+                    )
+                    self.controls.append(f'L{lag}_D_{self.depvar}')
         
         # Reset index for easier manipulation
         self.data = self.data.reset_index()
@@ -456,58 +574,64 @@ class LPDiD:
                     f'CCS_m{h}'
                 ] = 0
 
-    def _generate_long_differences(self):
-        """Generate long differences for dependent variable"""
+    def _generate_single_horizon_diff(self, unit_group, horizon, is_pre=False):
+        """Generate long difference for a single unit and horizon (helper for parallel processing)"""
+        unit_id = unit_group[0]
+        group_data = unit_group[1]
+        
         if self.pmd is None:
             # Standard long differences
             if self.min_time_controls:
                 # Use min(t-1, t+h) for control periods
-                for h in range(self.post_window + 1):
-                    # For post-treatment periods (h >= 0), always use t-1 as control
-                    self.data[f'D{h}y'] = (
-                        self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                        self.data.groupby(self.unit)[self.depvar].shift(1)
-                    )
-                
-                for h in range(2, self.pre_window + 1):
-                    if h == 2:
+                if not is_pre:
+                    # Post-treatment periods (h >= 0), always use t-1 as control
+                    diff = group_data[self.depvar].shift(-horizon) - group_data[self.depvar].shift(1)
+                else:
+                    if horizon == 2:
                         # For horizon -2, use standard t-1 control
                         control_shift = 1
                     else:
                         # For longer horizons, use control closer to the outcome period
-                        control_shift = h - 1  # Use t-(h-1) as control instead of t-1
+                        control_shift = horizon - 1
                     
                     if self.swap_pre_diff:
-                        self.data[f'Dm{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(control_shift) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(h)
-                        )
+                        diff = group_data[self.depvar].shift(control_shift) - group_data[self.depvar].shift(horizon)
                     else:
-                        self.data[f'Dm{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(control_shift)
-                        )
+                        diff = group_data[self.depvar].shift(horizon) - group_data[self.depvar].shift(control_shift)
             else:
                 # Standard implementation
-                for h in range(self.post_window + 1):
-                    self.data[f'D{h}y'] = (
-                        self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                        self.data.groupby(self.unit)[self.depvar].shift(1)
-                    )
-                
-                for h in range(2, self.pre_window + 1):
+                if not is_pre:
+                    diff = group_data[self.depvar].shift(-horizon) - group_data[self.depvar].shift(1)
+                else:
                     if self.swap_pre_diff:
-                        self.data[f'Dm{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(1) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(h)
-                        )
+                        diff = group_data[self.depvar].shift(1) - group_data[self.depvar].shift(horizon)
                     else:
-                        self.data[f'Dm{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(1)
-                        )
+                        diff = group_data[self.depvar].shift(horizon) - group_data[self.depvar].shift(1)
+        else:
+            # For pmd cases, we'll use the pre-computed aveLY column
+            if 'aveLY' in group_data.columns:
+                if not is_pre:
+                    diff = group_data[self.depvar].shift(-horizon) - group_data['aveLY']
+                else:
+                    if self.swap_pre_diff:
+                        diff = group_data['aveLY'] - group_data[self.depvar].shift(horizon)
+                    else:
+                        diff = group_data[self.depvar].shift(horizon) - group_data['aveLY']
+            else:
+                # Fallback if aveLY not computed yet
+                return unit_id, pd.Series(dtype=float)
         
-        elif self.pmd == 'max':
+        return unit_id, diff
+    
+    def _generate_long_differences(self):
+        """Generate long differences for dependent variable"""
+        # Determine number of cores
+        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
+        total_horizons = (self.post_window + 1) + (self.pre_window - 1)
+        use_parallel = n_cores > 1 and total_horizons > 3
+        
+        # First, handle pmd calculations if needed (these are sequential as they depend on group-wise operations)
+        if self.pmd == 'max':
             # Use all available pre-treatment periods
             def calc_pre_mean(group):
                 cumsum = group[self.depvar].expanding().sum()
@@ -515,9 +639,6 @@ class LPDiD:
                 return cumsum.shift(1) / count.shift(1)
             
             if self.min_time_controls:
-                # For pmd='max' with min_time_controls, we need to modify the reference period
-                # This is a more complex case that would require careful implementation
-                # For now, issue a warning and fall back to standard pmd behavior
                 warnings.warn("min_time_controls with pmd='max' is not yet implemented. "
                              "Using standard pmd='max' behavior.")
             
@@ -525,59 +646,152 @@ class LPDiD:
                 calc_pre_mean
             ).reset_index(drop=True)
             
-            # Create differences
-            for h in range(self.post_window + 1):
-                self.data[f'D{h}y'] = (
-                    self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                    self.data['aveLY']
-                )
-            
-            for h in range(2, self.pre_window + 1):
-                if self.swap_pre_diff:
-                    self.data[f'Dm{h}y'] = (
-                        self.data['aveLY'] - 
-                        self.data.groupby(self.unit)[self.depvar].shift(h)
-                    )
-                else:
-                    self.data[f'Dm{h}y'] = (
-                        self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                        self.data['aveLY']
-                    )
-        
-        else:
+        elif self.pmd is not None:
             # Moving average over [-pmd, -1]
             def calc_ma(group, window):
                 return group[self.depvar].rolling(window=window, min_periods=window).mean()
             
             if self.min_time_controls:
-                # For pmd with min_time_controls, we need to modify the reference period
-                # This is a more complex case that would require careful implementation
-                # For now, issue a warning and fall back to standard pmd behavior
                 warnings.warn("min_time_controls with pmd specification is not yet implemented. "
                              "Using standard pmd behavior.")
             
             self.data['aveLY'] = self.data.groupby(self.unit).apply(
                 lambda x: calc_ma(x, self.pmd).shift(1)
             ).reset_index(drop=True)
+        
+        # Now generate differences
+        if use_parallel:
+            print(f"Generating long differences in parallel for {total_horizons} horizons...")
             
-            # Create differences
+            # Prepare tasks
+            grouped = list(self.data.groupby(self.unit))
+            tasks = []
+            
+            # Post-treatment horizons
             for h in range(self.post_window + 1):
-                self.data[f'D{h}y'] = (
-                    self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                    self.data['aveLY']
+                tasks.extend([(unit_group, h, False) for unit_group in grouped])
+            
+            # Pre-treatment horizons
+            for h in range(2, self.pre_window + 1):
+                tasks.extend([(unit_group, h, True) for unit_group in grouped])
+            
+            # Run in parallel with progress bar
+            with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
+                results = parallel(
+                    delayed(self._generate_single_horizon_diff)(unit_group, horizon, is_pre)
+                    for unit_group, horizon, is_pre in tqdm(tasks, desc="Computing long differences")
                 )
             
-            for h in range(2, self.pre_window + 1):
-                if self.swap_pre_diff:
-                    self.data[f'Dm{h}y'] = (
-                        self.data['aveLY'] - 
-                        self.data.groupby(self.unit)[self.depvar].shift(h)
-                    )
+            # Reorganize results by horizon
+            # Post-treatment
+            for h in range(self.post_window + 1):
+                col_name = f'D{h}y'
+                # Collect results for this horizon
+                horizon_results = []
+                for unit_id, diff in results:
+                    if len(diff) > 0:
+                        horizon_results.append(diff)
+                
+                # Find the corresponding results in the flat list
+                start_idx = h * len(grouped)
+                end_idx = start_idx + len(grouped)
+                horizon_series = []
+                for idx in range(start_idx, end_idx):
+                    if idx < len(results):
+                        _, series = results[idx]
+                        if len(series) > 0:
+                            horizon_series.append(series)
+                
+                if horizon_series:
+                    self.data[col_name] = pd.concat(horizon_series).sort_index()
+            
+            # Pre-treatment
+            pre_start_idx = (self.post_window + 1) * len(grouped)
+            for i, h in enumerate(range(2, self.pre_window + 1)):
+                col_name = f'Dm{h}y'
+                # Find the corresponding results
+                start_idx = pre_start_idx + i * len(grouped)
+                end_idx = start_idx + len(grouped)
+                horizon_series = []
+                for idx in range(start_idx, end_idx):
+                    if idx < len(results):
+                        _, series = results[idx]
+                        if len(series) > 0:
+                            horizon_series.append(series)
+                
+                if horizon_series:
+                    self.data[col_name] = pd.concat(horizon_series).sort_index()
+        
+        else:
+            # Sequential version (original code)
+            if self.pmd is None:
+                # Standard long differences
+                if self.min_time_controls:
+                    # Use min(t-1, t+h) for control periods
+                    for h in range(self.post_window + 1):
+                        # For post-treatment periods (h >= 0), always use t-1 as control
+                        self.data[f'D{h}y'] = (
+                            self.data.groupby(self.unit)[self.depvar].shift(-h) - 
+                            self.data.groupby(self.unit)[self.depvar].shift(1)
+                        )
+                    
+                    for h in range(2, self.pre_window + 1):
+                        if h == 2:
+                            # For horizon -2, use standard t-1 control
+                            control_shift = 1
+                        else:
+                            # For longer horizons, use control closer to the outcome period
+                            control_shift = h - 1  # Use t-(h-1) as control instead of t-1
+                        
+                        if self.swap_pre_diff:
+                            self.data[f'Dm{h}y'] = (
+                                self.data.groupby(self.unit)[self.depvar].shift(control_shift) - 
+                                self.data.groupby(self.unit)[self.depvar].shift(h)
+                            )
+                        else:
+                            self.data[f'Dm{h}y'] = (
+                                self.data.groupby(self.unit)[self.depvar].shift(h) - 
+                                self.data.groupby(self.unit)[self.depvar].shift(control_shift)
+                            )
                 else:
-                    self.data[f'Dm{h}y'] = (
-                        self.data.groupby(self.unit)[self.depvar].shift(h) - 
+                    # Standard implementation
+                    for h in range(self.post_window + 1):
+                        self.data[f'D{h}y'] = (
+                            self.data.groupby(self.unit)[self.depvar].shift(-h) - 
+                            self.data.groupby(self.unit)[self.depvar].shift(1)
+                        )
+                    
+                    for h in range(2, self.pre_window + 1):
+                        if self.swap_pre_diff:
+                            self.data[f'Dm{h}y'] = (
+                                self.data.groupby(self.unit)[self.depvar].shift(1) - 
+                                self.data.groupby(self.unit)[self.depvar].shift(h)
+                            )
+                        else:
+                            self.data[f'Dm{h}y'] = (
+                                self.data.groupby(self.unit)[self.depvar].shift(h) - 
+                                self.data.groupby(self.unit)[self.depvar].shift(1)
+                            )
+            else:
+                # With pmd, aveLY is already computed
+                # Create differences
+                for h in range(self.post_window + 1):
+                    self.data[f'D{h}y'] = (
+                        self.data.groupby(self.unit)[self.depvar].shift(-h) - 
                         self.data['aveLY']
                     )
+                
+                for h in range(2, self.pre_window + 1):
+                    if self.swap_pre_diff:
+                        self.data[f'Dm{h}y'] = (
+                            self.data['aveLY'] - 
+                            self.data.groupby(self.unit)[self.depvar].shift(h)
+                        )
+                    else:
+                        self.data[f'Dm{h}y'] = (
+                            self.data.groupby(self.unit)[self.depvar].shift(h) - 
+                            self.data['aveLY']
+                        )
 
     def _compute_weights(self):
         """Compute weights for reweighted estimation"""
@@ -827,6 +1041,8 @@ class LPDiD:
                 # Handle inference for main effect
                 if self.wildbootstrap:
                     # Use pyfixest's built-in wildboottest method
+                    # NOTE: Wild bootstrap only adjusts p-values and t-statistics,
+                    # standard errors and confidence intervals remain analytical
                     try:
                         # Set seed for this specific test if provided
                         if self.seed is not None:
@@ -839,7 +1055,7 @@ class LPDiD:
                         
                         # Extract results from the wildboottest output (pandas Series)
                         if isinstance(wb_result, pd.Series):
-                            # Extract wild bootstrap p-value
+                            # Extract wild bootstrap p-value (this is the main adjustment)
                             if 'Pr(>|t|)' in wb_result.index:
                                 results['p'] = wb_result['Pr(>|t|)']
                             # Extract wild bootstrap t-statistic
@@ -847,7 +1063,7 @@ class LPDiD:
                                 results['t'] = wb_result['t value']
                         
                         # Use analytical standard errors and confidence intervals
-                        # since pyfixest wildboottest focuses on p-values and t-stats
+                        # NOTE: These are NOT adjusted by wild bootstrap
                         if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
                             results['se'] = fit.se().loc['D_treat']
                         if hasattr(fit, 'confint'):
@@ -903,31 +1119,81 @@ class LPDiD:
         LPDiDResults
             An object containing the estimated event-study coefficients and other relevant information.
         """
+        print("\n" + "="*60)
+        print("Starting LP-DiD Estimation")
+        print("="*60)
+        
         # Step 1: Identify units that are never treated to serve as clean controls.
+        print("\nStep 1: Identifying clean control samples...")
         self._identify_clean_controls()
+        print("Clean control identification complete.")
         
         # Step 2: Create the long-differenced outcome variable for each horizon.
+        print("\nStep 2: Generating long differences...")
         self._generate_long_differences()
+        print("Long differences generation complete.")
         
         # Step 3: Compute regression weights if a weighting variable is specified.
-        self._compute_weights()
+        if self.rw:
+            print("\nStep 3: Computing regression weights...")
+            self._compute_weights()
+            print("Weight computation complete.")
         
         # Step 4: Run event-study regressions for each specified horizon.
-        event_study_results = []
+        print(f"\nStep 4: Running {(self.pre_window - 1) + (self.post_window + 1)} regressions...")
         
-        # Run regressions for each pre-treatment period (h=2 to pre_window).
-        # h=1 is the period just before treatment, which is normalized to 0 and omitted here.
+        # Determine actual number of cores to use
+        if self.n_jobs == -1:
+            n_cores = multiprocessing.cpu_count()
+        else:
+            n_cores = min(self.n_jobs, multiprocessing.cpu_count())
+        
+        # Prepare regression tasks
+        regression_tasks = []
+        
+        # Add pre-treatment periods (h=2 to pre_window)
         for h in range(2, self.pre_window + 1):
-            result = self._run_single_regression(h, is_pre=True)
-            if result:
-                event_study_results.append(result)
+            regression_tasks.append((h, True))  # True indicates pre-treatment
         
-        # Run regressions for each post-treatment period (h=0 to post_window).
-        # h=0 is the treatment period itself.
+        # Add post-treatment periods (h=0 to post_window)
         for h in range(self.post_window + 1):
-            result = self._run_single_regression(h, is_pre=False)
-            if result:
-                event_study_results.append(result)
+            regression_tasks.append((h, False))  # False indicates post-treatment
+        
+        # Run regressions (parallel or sequential)
+        if n_cores > 1 and len(regression_tasks) > 1:
+            print(f"Running regressions in parallel using {n_cores} cores...")
+            
+            # Set up parallel processing with appropriate backend for each OS
+            if platform.system() == 'Windows':
+                # Windows requires 'loky' backend for multiprocessing
+                backend = 'loky'
+            else:
+                # Unix-based systems (Mac, Linux) can use 'loky' or 'multiprocessing'
+                backend = 'loky'  # loky is more robust across platforms
+            
+            with Parallel(n_jobs=n_cores, backend=backend, verbose=0) as parallel:
+                # Run regressions in parallel with progress indicator
+                results = parallel(
+                    delayed(self._run_single_regression)(h, is_pre) 
+                    for h, is_pre in regression_tasks
+                )
+                
+            # Filter out None results
+            event_study_results = [r for r in results if r is not None]
+            print(f"Parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+            
+        else:
+            # Sequential execution
+            print("Running regressions sequentially...")
+            event_study_results = []
+            
+            for i, (h, is_pre) in enumerate(regression_tasks):
+                print(f"  Progress: {i+1}/{len(regression_tasks)} - Horizon {-h if is_pre else h}...", end='\r')
+                result = self._run_single_regression(h, is_pre)
+                if result:
+                    event_study_results.append(result)
+            
+            print(f"\nSequential estimation complete. Successfully estimated {len(event_study_results)} horizons.")
         
         # Step 5: Collate results into a structured DataFrame.
         if event_study_results:
