@@ -33,6 +33,26 @@ warnings.filterwarnings("ignore", message=".*OMP.*")
 warnings.filterwarnings("ignore", message=".*A worker stopped while some jobs were given to the executor.*")
 
 import sys
+import platform
+import multiprocessing
+
+# Fix for Polars fork() warning on Linux
+# On Linux, multiprocessing defaults to 'fork' which can cause deadlocks with Polars
+# Setting to 'spawn' prevents the fork() usage that triggers the warning
+if platform.system() == 'Linux':
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # start_method may have already been set by another module
+        # Check if it's already set to 'spawn'
+        current_method = multiprocessing.get_start_method()
+        if current_method != 'spawn':
+            import warnings
+            warnings.warn(
+                f"Multiprocessing start method is already set to '{current_method}'. "
+                "To avoid Polars fork() warnings, consider setting it to 'spawn' before importing LPDiD.",
+                UserWarning
+            )
 
 import numpy as np
 import pandas as pd
@@ -43,8 +63,6 @@ from joblib import Parallel, delayed
 from dataclasses import dataclass
 from scipy import stats
 import re
-import multiprocessing
-import platform
 from tqdm import tqdm
 
 # Import wildboottest package
@@ -957,9 +975,12 @@ class LPDiD:
         # Set up clustering
         if len(self.cluster_vars) == 1:
             vcov = {'CRV1': self.cluster_vars[0]}
+        elif len(self.cluster_vars) == 2:
+            # Two-way clustering - use CRV3 for multi-way clustering
+            vcov = {'CRV3': self.cluster_vars}
         else:
-            # Multi-way clustering
-            vcov = 'twoway'  # pyfixest will handle the cluster variables
+            # For 3+ clustering variables, use CRV3 (multi-way clustering)
+            vcov = {'CRV3': self.cluster_vars}
         
         # Add weights if specified
         if self.weights and weight_var:
@@ -1312,9 +1333,12 @@ class LPDiDPois(LPDiD):
         # Set up clustering
         if len(self.cluster_vars) == 1:
             vcov = {'CRV1': self.cluster_vars[0]}
+        elif len(self.cluster_vars) == 2:
+            # Two-way clustering - use CRV3 for multi-way clustering
+            vcov = {'CRV3': self.cluster_vars}
         else:
-            # Multi-way clustering
-            vcov = 'twoway'  # pyfixest will handle the cluster variables
+            # For 3+ clustering variables, use CRV3 (multi-way clustering)
+            vcov = {'CRV3': self.cluster_vars}
         
         # Add weights if specified
         if self.weights and weight_var:
