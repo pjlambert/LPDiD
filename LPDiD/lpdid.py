@@ -36,23 +36,34 @@ import sys
 import platform
 import multiprocessing
 
-# Fix for Polars fork() warning on Linux
-# On Linux, multiprocessing defaults to 'fork' which can cause deadlocks with Polars
+# Fix for Polars fork() warning on Linux and other platforms
 # Setting to 'spawn' prevents the fork() usage that triggers the warning
-if platform.system() == 'Linux':
-    try:
+# This is especially important on Linux where fork is the default
+try:
+    current_method = multiprocessing.get_start_method(allow_none=True)
+    if current_method is None or (platform.system() == 'Linux' and current_method == 'fork'):
         multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # start_method may have already been set by another module
-        # Check if it's already set to 'spawn'
-        current_method = multiprocessing.get_start_method()
-        if current_method != 'spawn':
-            import warnings
-            warnings.warn(
-                f"Multiprocessing start method is already set to '{current_method}'. "
-                "To avoid Polars fork() warnings, consider setting it to 'spawn' before importing LPDiD.",
-                UserWarning
-            )
+        
+        # Also configure joblib to use spawn
+        try:
+            import joblib
+            # Configure joblib's multiprocessing backend to use spawn
+            if hasattr(joblib.parallel, 'BACKENDS'):
+                if 'multiprocessing' in joblib.parallel.BACKENDS:
+                    joblib.parallel.BACKENDS['multiprocessing'].start_method = 'spawn'
+        except Exception:
+            pass  # joblib configuration is optional
+            
+except RuntimeError as e:
+    # start_method may have already been set by another module
+    current_method = multiprocessing.get_start_method()
+    if platform.system() == 'Linux' and current_method != 'spawn':
+        warnings.warn(
+            f"Multiprocessing start method is already set to '{current_method}'. "
+            f"To avoid Polars fork() warnings on Linux, it's recommended to use 'spawn'. "
+            f"Set this before importing LPDiD: multiprocessing.set_start_method('spawn', force=True)",
+            UserWarning
+        )
 
 import numpy as np
 import pandas as pd
@@ -1035,11 +1046,11 @@ class LPDiD:
         if len(self.cluster_vars) == 1:
             vcov = {'CRV1': self.cluster_vars[0]}
         elif len(self.cluster_vars) == 2:
-            # Two-way clustering - use CRV3 for multi-way clustering
-            vcov = {'CRV3': self.cluster_vars}
+            # Two-way clustering - use CRV1 with string format
+            vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         else:
-            # For 3+ clustering variables, use CRV3 (multi-way clustering)
-            vcov = {'CRV3': self.cluster_vars}
+            # For 3+ clustering variables, also use string format
+            vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         
         # Add weights if specified
         if self.weights and weight_var:
@@ -1393,11 +1404,11 @@ class LPDiDPois(LPDiD):
         if len(self.cluster_vars) == 1:
             vcov = {'CRV1': self.cluster_vars[0]}
         elif len(self.cluster_vars) == 2:
-            # Two-way clustering - use CRV3 for multi-way clustering
-            vcov = {'CRV3': self.cluster_vars}
+            # Two-way clustering - use CRV1 with string format
+            vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         else:
-            # For 3+ clustering variables, use CRV3 (multi-way clustering)
-            vcov = {'CRV3': self.cluster_vars}
+            # For 3+ clustering variables, also use string format
+            vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         
         # Add weights if specified
         if self.weights and weight_var:
