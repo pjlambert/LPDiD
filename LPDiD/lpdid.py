@@ -250,6 +250,10 @@ class LPDiD:
     copy_data : bool, default False
         If True, creates a copy of the data before estimation in pyfixest. This can be useful
         to avoid modifying the original data but increases memory usage.
+    mp_type : str, optional
+        The multiprocessing start method to use ('fork', 'spawn', or 'forkserver'). 
+        On Linux, 'spawn' is recommended to avoid Polars fork() warnings. 
+        If None, uses the system default. Only affects parallel processing when n_jobs > 1.
     """
     
     def __init__(self, 
@@ -279,6 +283,7 @@ class LPDiD:
                  n_jobs: int = 1,
                  lean: bool = True,
                  copy_data: bool = False,
+                 mp_type: Optional[str] = None,
                  # Backward compatibility parameters
                  controls: Optional[List[str]] = None,
                  absorb: Optional[List[str]] = None,
@@ -350,6 +355,10 @@ class LPDiD:
         self.n_jobs = n_jobs
         self.lean = lean
         self.copy_data = copy_data
+        self.mp_type = mp_type
+        
+        # Set multiprocessing start method if specified
+        self._configure_multiprocessing()
         
         # Validate inputs
         self._validate_inputs()
@@ -375,6 +384,50 @@ class LPDiD:
         self._prepare_data()
         print(f"Data preparation complete. Dataset has {len(self.data)} observations.")
         
+    def _configure_multiprocessing(self):
+        """Configure multiprocessing start method based on mp_type parameter"""
+        if self.mp_type is None:
+            return  # Use system default
+        
+        # Validate mp_type
+        valid_methods = ['fork', 'spawn', 'forkserver']
+        if self.mp_type not in valid_methods:
+            raise ValueError(f"mp_type must be one of {valid_methods}, got '{self.mp_type}'")
+        
+        # Check if forkserver is supported (Unix only)
+        if self.mp_type == 'forkserver' and platform.system() == 'Windows':
+            raise ValueError("forkserver mp_type is not supported on Windows")
+        
+        try:
+            # Get current method to check if it's already set
+            current_method = multiprocessing.get_start_method(allow_none=True)
+            
+            if current_method is None:
+                # No method set yet, safe to set
+                multiprocessing.set_start_method(self.mp_type)
+                print(f"Set multiprocessing start method to '{self.mp_type}'")
+            elif current_method != self.mp_type:
+                # Different method already set, try force setting
+                try:
+                    multiprocessing.set_start_method(self.mp_type, force=True)
+                    print(f"Changed multiprocessing start method from '{current_method}' to '{self.mp_type}'")
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"Could not change multiprocessing start method from '{current_method}' to '{self.mp_type}': {e}. "
+                        f"Using '{current_method}' instead.",
+                        UserWarning
+                    )
+            else:
+                # Same method already set, no action needed
+                print(f"Multiprocessing start method already set to '{self.mp_type}'")
+                
+        except Exception as e:
+            warnings.warn(
+                f"Failed to configure multiprocessing start method '{self.mp_type}': {e}. "
+                "Using system default.",
+                UserWarning
+            )
+
     def _validate_inputs(self):
         """Validate input parameters"""
         # Check if pre_window or post_window is specified
@@ -434,6 +487,12 @@ class LPDiD:
         print(f"  Available CPU cores: {multiprocessing.cpu_count()}")
         print(f"  Cores to be used: {actual_cores}")
         print(f"  Total regressions to run: {total_regressions}")
+        
+        # Show multiprocessing configuration
+        current_mp_method = multiprocessing.get_start_method()
+        print(f"  Multiprocessing start method: {current_mp_method}")
+        if self.mp_type and self.mp_type != current_mp_method:
+            print(f"  Requested mp_type: {self.mp_type} (differs from current method)")
         
         # Additional options
         if self.controls:
