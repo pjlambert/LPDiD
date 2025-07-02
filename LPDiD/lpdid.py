@@ -5,42 +5,34 @@ Based on Dube, Girardi, Jordà, and Taylor (2023)
 
 # Set OpenMP environment variables BEFORE importing numpy/scipy
 import os
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['OMP_MAX_ACTIVE_LEVELS'] = '2'
-# Additional OMP settings that might help
-os.environ['OMP_NESTED'] = 'FALSE'
-os.environ['OMP_THREAD_LIMIT'] = '1'
+
+# Handle OpenMP configuration for high-performance scenarios
+# Only set if user hasn't explicitly configured these
+if 'OMP_NESTED' not in os.environ:
+    # Disable nested parallelism to avoid deprecated warning
+    os.environ['OMP_NESTED'] = 'FALSE'
+    
+if 'OMP_MAX_ACTIVE_LEVELS' not in os.environ:
+    # Set max active levels to 1 to prevent nesting
+    os.environ['OMP_MAX_ACTIVE_LEVELS'] = '1'
+
+# IMPORTANT: We do NOT set OMP_NUM_THREADS here
+# This allows:
+# 1. Users to set it themselves for their specific hardware
+# 2. The system to use all available cores by default
+# 3. Optimal performance on high-core-count systems (e.g., 64 cores)
+
+# For best performance with joblib parallelism, users can set:
+# - OMP_NUM_THREADS=1 when using many joblib workers (n_jobs=-1)
+# - OMP_NUM_THREADS=(cores/n_jobs) for balanced thread/process parallelism
 
 import warnings
-# Explicitly suppress all OMP-related warnings
+# Suppress various warnings that can occur during parallel processing
 warnings.filterwarnings("ignore", message=".*omp_set_nested.*")
-warnings.filterwarnings("ignore", message=".*OMP.*nested.*deprecated.*")
-warnings.filterwarnings("ignore", message=".*OMP_NESTED.*deprecated.*")
-warnings.filterwarnings("ignore", message=".*Cannot form a team.*")
-warnings.filterwarnings("ignore", message=".*Consider unsetting.*")
-warnings.filterwarnings("ignore", category=UserWarning, module=".*omp.*")
+warnings.filterwarnings("ignore", message=".*OMP.*")
+warnings.filterwarnings("ignore", message=".*A worker stopped while some jobs were given to the executor.*")
 
-# Also try to suppress at the system level
 import sys
-if hasattr(sys, 'stderr'):
-    class WarningFilter:
-        def __init__(self, stream):
-            self.stream = stream
-            
-        def write(self, data):
-            # Filter out OMP warnings
-            if any(phrase in data for phrase in [
-                "OMP: Info #276", "OMP: Info #268", "OMP: Warning #96", "OMP: Hint"
-            ]):
-                return
-            self.stream.write(data)
-            
-        def flush(self):
-            self.stream.flush()
-    
-    # Temporarily replace stderr to filter OMP warnings
-    original_stderr = sys.stderr
-    sys.stderr = WarningFilter(original_stderr)
 
 import numpy as np
 import pandas as pd
@@ -234,6 +226,12 @@ class LPDiD:
         The name of a column to be used as regression weights.
     n_jobs : int, default 1
         The number of CPU cores to use for parallel processing. -1 uses all available cores.
+    lean : bool, default True
+        If True, returns a more memory-efficient regression object from pyfixest. This reduces
+        memory usage by not storing certain intermediate results.
+    copy_data : bool, default False
+        If True, creates a copy of the data before estimation in pyfixest. This can be useful
+        to avoid modifying the original data but increases memory usage.
     """
     
     def __init__(self, 
@@ -261,6 +259,8 @@ class LPDiD:
                  seed: Optional[int] = None,
                  weights: Optional[str] = None,
                  n_jobs: int = 1,
+                 lean: bool = True,
+                 copy_data: bool = False,
                  # Backward compatibility parameters
                  controls: Optional[List[str]] = None,
                  absorb: Optional[List[str]] = None,
@@ -330,6 +330,8 @@ class LPDiD:
         self.seed = seed
         self.weights = weights
         self.n_jobs = n_jobs
+        self.lean = lean
+        self.copy_data = copy_data
         
         # Validate inputs
         self._validate_inputs()
@@ -473,7 +475,8 @@ class LPDiD:
                 grouped = list(self.data.groupby(level=0))
                 tasks = [(group, lag, self.depvar) for lag in range(1, self.ylags + 1) for _, group in grouped]
                 
-                with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
+                # Increase timeout and use more robust parallel configuration
+                with Parallel(n_jobs=n_cores, backend='loky', verbose=0, timeout=300, max_nbytes='50M') as parallel:
                     results = parallel(
                         delayed(self._create_single_lag)(group, lag, var)
                         for _, group, lag, var in tqdm(
@@ -505,7 +508,7 @@ class LPDiD:
                 # Similar parallel approach for differenced lags
                 grouped = list(self.data.groupby(level=0))
                 
-                with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
+                with Parallel(n_jobs=n_cores, backend='loky', verbose=0, timeout=300, max_nbytes='50M') as parallel:
                     results = parallel(
                         delayed(self._create_single_lag)(group, lag, f'D_{self.depvar}')
                         for _, group in grouped
@@ -574,63 +577,45 @@ class LPDiD:
                     f'CCS_m{h}'
                 ] = 0
 
-    def _generate_single_horizon_diff(self, unit_group, horizon, is_pre=False):
-        """Generate long difference for a single unit and horizon (helper for parallel processing)"""
-        unit_id = unit_group[0]
-        group_data = unit_group[1]
-        
-        if self.pmd is None:
-            # Standard long differences
-            if self.min_time_controls:
-                # Use min(t-1, t+h) for control periods
-                if not is_pre:
-                    # Post-treatment periods (h >= 0), always use t-1 as control
-                    diff = group_data[self.depvar].shift(-horizon) - group_data[self.depvar].shift(1)
-                else:
-                    if horizon == 2:
-                        # For horizon -2, use standard t-1 control
-                        control_shift = 1
-                    else:
-                        # For longer horizons, use control closer to the outcome period
-                        control_shift = horizon - 1
-                    
-                    if self.swap_pre_diff:
-                        diff = group_data[self.depvar].shift(control_shift) - group_data[self.depvar].shift(horizon)
-                    else:
-                        diff = group_data[self.depvar].shift(horizon) - group_data[self.depvar].shift(control_shift)
-            else:
-                # Standard implementation
-                if not is_pre:
-                    diff = group_data[self.depvar].shift(-horizon) - group_data[self.depvar].shift(1)
-                else:
-                    if self.swap_pre_diff:
-                        diff = group_data[self.depvar].shift(1) - group_data[self.depvar].shift(horizon)
-                    else:
-                        diff = group_data[self.depvar].shift(horizon) - group_data[self.depvar].shift(1)
-        else:
-            # For pmd cases, we'll use the pre-computed aveLY column
-            if 'aveLY' in group_data.columns:
-                if not is_pre:
-                    diff = group_data[self.depvar].shift(-horizon) - group_data['aveLY']
-                else:
-                    if self.swap_pre_diff:
-                        diff = group_data['aveLY'] - group_data[self.depvar].shift(horizon)
-                    else:
-                        diff = group_data[self.depvar].shift(horizon) - group_data['aveLY']
-            else:
-                # Fallback if aveLY not computed yet
-                return unit_id, pd.Series(dtype=float)
-        
-        return unit_id, diff
-    
-    def _generate_long_differences(self):
-        """Generate long differences for dependent variable"""
-        # Determine number of cores
+    def _should_use_parallel_processing(self):
+        """Determine if parallel processing should be used based on data size and complexity"""
         n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
         total_horizons = (self.post_window + 1) + (self.pre_window - 1)
-        use_parallel = n_cores > 1 and total_horizons > 3
+        n_observations = len(self.data)
+        n_units = self.data[self.unit].nunique()
         
-        # First, handle pmd calculations if needed (these are sequential as they depend on group-wise operations)
+        # Factors that favor parallelization
+        large_dataset = n_observations > 50000
+        many_horizons = total_horizons > 10
+        many_units = n_units > 1000
+        many_cores_requested = n_cores > 4
+        
+        # Factors that favor vectorization
+        complex_pmd = self.pmd is not None
+        min_time_logic = self.min_time_controls
+        
+        # Decision logic
+        if complex_pmd or min_time_logic:
+            # Complex logic benefits from parallelization if dataset is large
+            return large_dataset and many_cores_requested and n_cores <= 4
+        else:
+            # Simple logic: use parallel only for very large datasets with many cores
+            return large_dataset and many_horizons and many_units and n_cores <= 4
+    
+    def _generate_long_differences(self):
+        """Generate long differences for dependent variable using optimized vectorized approach"""
+        # Determine processing strategy
+        total_horizons = (self.post_window + 1) + (self.pre_window - 1)
+        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
+        use_parallel = self._should_use_parallel_processing()
+        
+        print(f"Generating long differences for {total_horizons} horizons...")
+        if use_parallel:
+            print(f"Using parallel processing with {n_cores} cores")
+        else:
+            print("Using optimized vectorized approach")
+        
+        # First, handle pmd calculations if needed
         if self.pmd == 'max':
             # Use all available pre-treatment periods
             def calc_pre_mean(group):
@@ -659,139 +644,180 @@ class LPDiD:
                 lambda x: calc_ma(x, self.pmd).shift(1)
             ).reset_index(drop=True)
         
-        # Now generate differences
-        if use_parallel:
-            print(f"Generating long differences in parallel for {total_horizons} horizons...")
-            
-            # Prepare tasks
-            grouped = list(self.data.groupby(self.unit))
-            tasks = []
-            
-            # Post-treatment horizons
-            for h in range(self.post_window + 1):
-                tasks.extend([(unit_group, h, False) for unit_group in grouped])
-            
-            # Pre-treatment horizons
-            for h in range(2, self.pre_window + 1):
-                tasks.extend([(unit_group, h, True) for unit_group in grouped])
-            
-            # Run in parallel with progress bar
-            with Parallel(n_jobs=n_cores, backend='loky', verbose=0) as parallel:
-                results = parallel(
-                    delayed(self._generate_single_horizon_diff)(unit_group, horizon, is_pre)
-                    for unit_group, horizon, is_pre in tqdm(tasks, desc="Computing long differences")
-                )
-            
-            # Reorganize results by horizon
-            # Post-treatment
-            for h in range(self.post_window + 1):
-                col_name = f'D{h}y'
-                # Collect results for this horizon
-                horizon_results = []
-                for unit_id, diff in results:
-                    if len(diff) > 0:
-                        horizon_results.append(diff)
-                
-                # Find the corresponding results in the flat list
-                start_idx = h * len(grouped)
-                end_idx = start_idx + len(grouped)
-                horizon_series = []
-                for idx in range(start_idx, end_idx):
-                    if idx < len(results):
-                        _, series = results[idx]
-                        if len(series) > 0:
-                            horizon_series.append(series)
-                
-                if horizon_series:
-                    self.data[col_name] = pd.concat(horizon_series).sort_index()
-            
-            # Pre-treatment
-            pre_start_idx = (self.post_window + 1) * len(grouped)
-            for i, h in enumerate(range(2, self.pre_window + 1)):
-                col_name = f'Dm{h}y'
-                # Find the corresponding results
-                start_idx = pre_start_idx + i * len(grouped)
-                end_idx = start_idx + len(grouped)
-                horizon_series = []
-                for idx in range(start_idx, end_idx):
-                    if idx < len(results):
-                        _, series = results[idx]
-                        if len(series) > 0:
-                            horizon_series.append(series)
-                
-                if horizon_series:
-                    self.data[col_name] = pd.concat(horizon_series).sort_index()
-        
+        # Generate differences using optimized approach
+        if use_parallel and (self.pmd is not None or self.min_time_controls):
+            # Use parallelization for complex cases with optimized batching
+            self._generate_differences_parallel_optimized()
         else:
-            # Sequential version (original code)
-            if self.pmd is None:
-                # Standard long differences
-                if self.min_time_controls:
-                    # Use min(t-1, t+h) for control periods
-                    for h in range(self.post_window + 1):
-                        # For post-treatment periods (h >= 0), always use t-1 as control
-                        self.data[f'D{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(1)
-                        )
-                    
-                    for h in range(2, self.pre_window + 1):
-                        if h == 2:
-                            # For horizon -2, use standard t-1 control
-                            control_shift = 1
-                        else:
-                            # For longer horizons, use control closer to the outcome period
-                            control_shift = h - 1  # Use t-(h-1) as control instead of t-1
-                        
-                        if self.swap_pre_diff:
-                            self.data[f'Dm{h}y'] = (
-                                self.data.groupby(self.unit)[self.depvar].shift(control_shift) - 
-                                self.data.groupby(self.unit)[self.depvar].shift(h)
-                            )
-                        else:
-                            self.data[f'Dm{h}y'] = (
-                                self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                                self.data.groupby(self.unit)[self.depvar].shift(control_shift)
-                            )
-                else:
-                    # Standard implementation
-                    for h in range(self.post_window + 1):
-                        self.data[f'D{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                            self.data.groupby(self.unit)[self.depvar].shift(1)
-                        )
-                    
-                    for h in range(2, self.pre_window + 1):
-                        if self.swap_pre_diff:
-                            self.data[f'Dm{h}y'] = (
-                                self.data.groupby(self.unit)[self.depvar].shift(1) - 
-                                self.data.groupby(self.unit)[self.depvar].shift(h)
-                            )
-                        else:
-                            self.data[f'Dm{h}y'] = (
-                                self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                                self.data.groupby(self.unit)[self.depvar].shift(1)
-                            )
-            else:
-                # With pmd, aveLY is already computed
-                # Create differences
+            # Use vectorized approach for standard cases
+            self._generate_differences_vectorized()
+    
+    def _generate_differences_vectorized(self):
+        """Generate long differences using optimized vectorized operations"""
+        # Pre-compute all shifts needed (this is highly optimized and can use multiple cores via BLAS)
+        shifts = {}
+        max_shift = max(self.post_window, self.pre_window)
+        
+        # Pre-compute all required shifts in one go
+        for h in range(-max_shift, max_shift + 2):  # Extra range to cover all cases
+            shifts[h] = self.data.groupby(self.unit)[self.depvar].shift(-h)
+        
+        # For h=0, it's just the original data (no shift)
+        shifts[0] = self.data.groupby(self.unit)[self.depvar].shift(0)
+        
+        if self.pmd is None:
+            # Standard long differences
+            if self.min_time_controls:
+                # Use min(t-1, t+h) for control periods
                 for h in range(self.post_window + 1):
-                    self.data[f'D{h}y'] = (
-                        self.data.groupby(self.unit)[self.depvar].shift(-h) - 
-                        self.data['aveLY']
-                    )
+                    # For post-treatment periods (h >= 0), always use t-1 as control
+                    self.data[f'D{h}y'] = shifts[h] - shifts[-1]
+                
+                for h in range(2, self.pre_window + 1):
+                    if h == 2:
+                        # For horizon -2, use standard t-1 control
+                        control_shift = -1
+                    else:
+                        # For longer horizons, use control closer to the outcome period
+                        control_shift = -(h - 1)  # Use t-(h-1) as control instead of t-1
+                    
+                    if self.swap_pre_diff:
+                        self.data[f'Dm{h}y'] = shifts[control_shift] - shifts[-h]
+                    else:
+                        self.data[f'Dm{h}y'] = shifts[-h] - shifts[control_shift]
+            else:
+                # Standard implementation - vectorized
+                for h in range(self.post_window + 1):
+                    self.data[f'D{h}y'] = shifts[h] - shifts[-1]
                 
                 for h in range(2, self.pre_window + 1):
                     if self.swap_pre_diff:
-                        self.data[f'Dm{h}y'] = (
-                            self.data['aveLY'] - 
-                            self.data.groupby(self.unit)[self.depvar].shift(h)
+                        self.data[f'Dm{h}y'] = shifts[-1] - shifts[-h]
+                    else:
+                        self.data[f'Dm{h}y'] = shifts[-h] - shifts[-1]
+        else:
+            # With pmd, aveLY is already computed - use vectorized operations
+            for h in range(self.post_window + 1):
+                self.data[f'D{h}y'] = shifts[-h] - self.data['aveLY']
+            
+            for h in range(2, self.pre_window + 1):
+                if self.swap_pre_diff:
+                    self.data[f'Dm{h}y'] = self.data['aveLY'] - shifts[h]
+                else:
+                    self.data[f'Dm{h}y'] = shifts[h] - self.data['aveLY']
+    
+    def _generate_differences_parallel_optimized(self):
+        """Generate long differences using optimized parallel processing with batching"""
+        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
+        
+        # Optimize the number of cores based on dataset size
+        n_units = self.data[self.unit].nunique()
+        optimal_cores = min(n_cores, max(2, n_units // 500))  # At least 500 units per core
+        
+        print(f"Using {optimal_cores} cores (reduced from {n_cores} for optimal performance)")
+        
+        # Create batches of units instead of individual unit tasks
+        units = sorted(self.data[self.unit].unique())
+        batch_size = max(50, len(units) // (optimal_cores * 2))  # Aim for 2 batches per core
+        unit_batches = [units[i:i + batch_size] for i in range(0, len(units), batch_size)]
+        
+        print(f"Processing {len(units)} units in {len(unit_batches)} batches of ~{batch_size} units each")
+        
+        # Use threading for I/O-bound operations, multiprocessing for CPU-bound
+        backend = 'threading' if len(self.data) < 100000 else 'loky'
+        
+        with Parallel(n_jobs=optimal_cores, backend=backend, verbose=0, timeout=300, max_nbytes='100M') as parallel:
+            results = parallel(
+                delayed(self._process_unit_batch)(batch, self.post_window, self.pre_window)
+                for batch in tqdm(unit_batches, desc="Computing long differences")
+            )
+        
+        # Combine results
+        self._combine_batch_results(results)
+    
+    def _process_unit_batch(self, unit_batch, post_window, pre_window):
+        """Process a batch of units for all horizons"""
+        batch_data = self.data[self.data[self.unit].isin(unit_batch)].copy()
+        results = {}
+        
+        # Process all horizons for this batch
+        for h in range(post_window + 1):
+            col_name = f'D{h}y'
+            if self.pmd is None:
+                if self.min_time_controls:
+                    results[col_name] = (
+                        batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
+                        batch_data.groupby(self.unit)[self.depvar].shift(1)
+                    )
+                else:
+                    results[col_name] = (
+                        batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
+                        batch_data.groupby(self.unit)[self.depvar].shift(1)
+                    )
+            else:
+                results[col_name] = (
+                    batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
+                    batch_data['aveLY']
+                )
+        
+        for h in range(2, pre_window + 1):
+            col_name = f'Dm{h}y'
+            if self.pmd is None:
+                if self.min_time_controls:
+                    if h == 2:
+                        control_shift = 1
+                    else:
+                        control_shift = h - 1
+                    
+                    if self.swap_pre_diff:
+                        results[col_name] = (
+                            batch_data.groupby(self.unit)[self.depvar].shift(control_shift) - 
+                            batch_data.groupby(self.unit)[self.depvar].shift(h)
                         )
                     else:
-                        self.data[f'Dm{h}y'] = (
-                            self.data.groupby(self.unit)[self.depvar].shift(h) - 
-                            self.data['aveLY']
+                        results[col_name] = (
+                            batch_data.groupby(self.unit)[self.depvar].shift(h) - 
+                            batch_data.groupby(self.unit)[self.depvar].shift(control_shift)
                         )
+                else:
+                    if self.swap_pre_diff:
+                        results[col_name] = (
+                            batch_data.groupby(self.unit)[self.depvar].shift(1) - 
+                            batch_data.groupby(self.unit)[self.depvar].shift(h)
+                        )
+                    else:
+                        results[col_name] = (
+                            batch_data.groupby(self.unit)[self.depvar].shift(h) - 
+                            batch_data.groupby(self.unit)[self.depvar].shift(1)
+                        )
+            else:
+                if self.swap_pre_diff:
+                    results[col_name] = (
+                        batch_data['aveLY'] - 
+                        batch_data.groupby(self.unit)[self.depvar].shift(h)
+                    )
+                else:
+                    results[col_name] = (
+                        batch_data.groupby(self.unit)[self.depvar].shift(h) - 
+                        batch_data['aveLY']
+                    )
+        
+        return unit_batch, results
+    
+    def _combine_batch_results(self, batch_results):
+        """Combine results from batched processing"""
+        all_columns = set()
+        for _, results in batch_results:
+            all_columns.update(results.keys())
+        
+        for col_name in all_columns:
+            column_parts = []
+            for unit_batch, results in batch_results:
+                if col_name in results:
+                    column_parts.append(results[col_name])
+            
+            if column_parts:
+                self.data[col_name] = pd.concat(column_parts).sort_index()
 
     def _compute_weights(self):
         """Compute weights for reweighted estimation"""
@@ -954,13 +980,17 @@ class LPDiD:
                     formula,
                     data=reg_data,
                     weights=use_weights,
-                    vcov=vcov
+                    vcov=vcov,
+                    lean=self.lean,
+                    copy_data=self.copy_data
                 )
             else:
                 fit = pf.feols(
                     formula,
                     data=reg_data,
-                    vcov=vcov
+                    vcov=vcov,
+                    lean=self.lean,
+                    copy_data=self.copy_data
                 )
             
             nobs = len(reg_data)
@@ -1171,7 +1201,7 @@ class LPDiD:
                 # Unix-based systems (Mac, Linux) can use 'loky' or 'multiprocessing'
                 backend = 'loky'  # loky is more robust across platforms
             
-            with Parallel(n_jobs=n_cores, backend=backend, verbose=0) as parallel:
+            with Parallel(n_jobs=n_cores, backend=backend, verbose=0, timeout=300, max_nbytes='50M') as parallel:
                 # Run regressions in parallel with progress indicator
                 results = parallel(
                     delayed(self._run_single_regression)(h, is_pre) 
@@ -1305,13 +1335,17 @@ class LPDiDPois(LPDiD):
                     formula, 
                     data=reg_data, 
                     weights=use_weights,
-                    vcov=vcov
+                    vcov=vcov,
+                    lean=self.lean,
+                    copy_data=self.copy_data
                 )
             else:
                 fit = pf.fepois(
                     formula, 
                     data=reg_data,
-                    vcov=vcov
+                    vcov=vcov,
+                    lean=self.lean,
+                    copy_data=self.copy_data
                 )
             
             nobs = len(reg_data)
