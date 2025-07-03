@@ -5,28 +5,41 @@ This package implements Local Projections Difference-in-Differences (LP-DiD) for
 ## Directory Structure
 
 ```
-lpdid/
-├── __init__.py            # Package initialization
-├── lpdid.py              # Main LP-DiD implementation
-├── wildboot_fallback.py  # Wild bootstrap fallback implementation
-├── utils.py              # Utility functions for data generation and testing
-├── setup.py              # Package setup configuration
-├── requirements.txt      # Package dependencies
-├── README.md            # Package documentation
-├── LICENSE              # License file (add your preferred license)
-├── .gitignore           # Git ignore patterns
-├── test_lpdid.py        # Unit tests
-├── example_usage.py     # Example usage scripts
-├── example_iv_interactions.py  # IV and interaction examples
-└── PACKAGE_STRUCTURE.md  # This file
+LPDiD/
+├── LPDiD/                      # Main package directory
+│   ├── __init__.py            # Package initialization
+│   ├── lpdid.py              # Main LP-DiD implementation
+│   ├── spawn_enforcer.py     # Multiprocessing spawn enforcement
+│   ├── wildboot_fallback.py  # Wild bootstrap fallback implementation
+│   └── utils.py              # Utility functions for data generation
+├── internal_tests/            # Test directory
+│   ├── test_basic_functionality.py  # Unit tests
+│   └── apply_lpdid_to_synth_data.ipynb  # Synthetic data examples
+├── docs/                      # Documentation
+│   └── PACKAGE_STRUCTURE.md  # This file
+├── examples/                  # Example scripts (to be populated)
+├── references/                # Reference papers
+│   ├── 17942.pdf
+│   └── ALocalProjectionsApproachToDifferen_preview.pdf
+├── pyproject.toml            # Modern packaging configuration
+├── setup.py                  # Setup configuration
+├── requirements.txt          # Package dependencies
+├── QUICKSTART.md            # Quick start guide
+├── README.md                # Main documentation
+├── CHANGELOG.md             # Version history
+├── LICENSE                  # MIT License
+├── LICENSE.txt              # MIT License (duplicate)
+├── MANIFEST.in              # Package manifest
+├── Makefile.txt             # Development tasks
+└── .gitignore               # Git ignore patterns
 ```
 
 ## Key Components
 
-### lpdid.py
+### LPDiD/lpdid.py
 The main module containing:
 - `LPDiD`: Main estimator class with formula interface
-- `LPDiDResults`: Results container with summary method (no plotting)
+- `LPDiDResults`: Results container with summary method
 - `parse_formula()`: Parse R-style formulas including IV specification
 - `parse_interactions()`: Parse interaction specifications
 - `parse_cluster_formula()`: Parse clustering formula
@@ -40,10 +53,16 @@ The main module containing:
   - `_run_single_regression()`: Single horizon regression with full diagnostics
   - `fit()`: Main estimation method
 
-### wildboot_fallback.py
+### LPDiD/spawn_enforcer.py
+Ensures multiprocessing uses the 'spawn' method for compatibility across platforms, especially important for parallel processing with joblib.
+
+### LPDiD/wildboot_fallback.py
 Fallback implementation of wild cluster bootstrap when the `wildboottest` package is not available.
 
-### Key Features
+### LPDiD/utils.py
+Utility functions for generating synthetic data for testing and demonstration purposes.
+
+## Key Features
 
 1. **Formula Interface**:
    - R-style formulas: `"~ controls | fixed_effects | endog ~ instruments"`
@@ -76,7 +95,7 @@ Fallback implementation of wild cluster bootstrap when the `wildboottest` packag
 6. **Parallel Processing**: 
    - Uses `joblib` for parallel computation across horizons
    - Controlled by `n_jobs` parameter
-   - Significant speedup for large panels
+   - Spawn method enforced for cross-platform compatibility
 
 7. **Flexible Treatment Types**:
    - Absorbing treatment (default)
@@ -98,14 +117,13 @@ Fallback implementation of wild cluster bootstrap when the `wildboottest` packag
     - Pooled pre/post estimates
     - IV diagnostics and first-stage results
     - Comprehensive summary method
-    - No plotting functionality (as requested)
 
 ## Installation
 
 ### From Source
 ```bash
 git clone <repository>
-cd lpdid
+cd LPDiD
 pip install -e .
 ```
 
@@ -118,12 +136,12 @@ pip install lpdid
 
 ### Basic Usage with Formula Interface
 ```python
-from lpdid import LPDiD
+from LPDiD import LPDiD
 
 # Specify controls and fixed effects using formula
 lpdid = LPDiD(
     data=df,
-    depvar='outcome',
+    outcome='outcome',
     unit='entity_id',
     time='period',
     treat='treatment',
@@ -141,7 +159,7 @@ results.summary()
 ```python
 lpdid_iv = LPDiD(
     data=df,
-    depvar='y',
+    outcome='y',
     unit='unit',
     time='time',
     treat='treat',
@@ -160,7 +178,7 @@ print(results.iv_diagnostics)  # Check first-stage F-stats
 ```python
 lpdid_het = LPDiD(
     data=df,
-    depvar='y',
+    outcome='y',
     unit='unit',
     time='time',
     treat='treat',
@@ -176,7 +194,7 @@ lpdid_het = LPDiD(
 ```python
 lpdid_iv_het = LPDiD(
     data=df,
-    depvar='y',
+    outcome='y',
     unit='unit',
     time='time',
     treat='treat',
@@ -193,9 +211,9 @@ lpdid_iv_het = LPDiD(
 
 Run unit tests:
 ```bash
-python -m pytest test_lpdid.py
-# or
-python test_lpdid.py
+python -m pytest internal_tests/test_basic_functionality.py
+# or directly
+python internal_tests/test_basic_functionality.py
 ```
 
 ## Performance Notes
@@ -220,14 +238,13 @@ python test_lpdid.py
 5. **Bootstrap**: Full wild cluster bootstrap implementation
 6. **Multi-way Clustering**: Native support for multiple clustering variables
 7. **Output**: Returns structured results object with comprehensive diagnostics
-8. **No Plotting**: Plotting functionality removed as requested
-9. **Parallel Processing**: Built-in parallel computation support
+8. **Parallel Processing**: Built-in parallel computation support with enforced spawn method
 
 ## API Reference
 
 ### Main Class
 ```python
-LPDiD(data, depvar, unit, time, treat, 
+LPDiD(data, outcome, unit, time, treat, 
       pre_window=None, post_window=None,
       formula=None, interactions=None, 
       cluster_formula=None, ...)

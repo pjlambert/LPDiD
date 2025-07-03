@@ -229,6 +229,13 @@ class LPDiD:
         The number of lags of the first-differenced dependent variable to include as controls.
     nevertreated : bool, default False
         If True, uses only never-treated units as the control group.
+    min_time_selection : str, optional
+        A pandas eval() expression to filter regression samples based on conditions at 
+        the earlier period of each long-difference. This ensures comparability by selecting
+        units based on their characteristics at the baseline period. The selection period is:
+        - For post-treatment horizons (t-1 to t+h): conditions evaluated at t-1
+        - For pre-treatment horizons (t-h to t-1): conditions evaluated at t-h
+        Example: "employed == 1" to include only units that were employed at baseline.
     wildbootstrap : int, optional
         The number of iterations for wild bootstrap inference. If None, analytical
         standard errors are used.
@@ -504,11 +511,12 @@ class LPDiD:
     def _print_init_info(self):
         """Print initialization information including parallel processing details"""
         print("\n" + "="*60)
-        print("LP-DiD Initialization")
+        print("LP-DiD Initialization (Linear Model)")
         print("="*60)
         
         # Basic info
         print(f"\nModel Information:")
+        print(f"  Model type: Linear regression (OLS)")
         print(f"  Dependent variable: {self.depvar}")
         print(f"  Unit identifier: {self.unit}")
         print(f"  Time identifier: {self.time}")
@@ -977,40 +985,52 @@ class LPDiD:
         return formula
 
     def _apply_min_time_selection(self, reg_data, horizon, is_pre=False):
-        """Apply min_time_selection filter to regression data"""
+        """Apply min_time_selection filter to regression data
+        
+        Selection is based on the earlier of the two periods in the long-difference:
+        - For post-treatment (t-1 to t+h): use t-1
+        - For pre-treatment (t-h to t-1): use t-h
+        """
         if not self.min_time_selection:
             return reg_data
         
-        # Determine the control period based on min_time_controls logic
-        if self.min_time_controls and is_pre and horizon > 2:
-            control_shift = horizon - 1
+        # Determine the selection period (earlier of the two periods in long-difference)
+        if is_pre:
+            # For pre-treatment: difference is between t-h and t-1, so use t-h
+            selection_shift = horizon
         else:
-            control_shift = 1
+            # For post-treatment: difference is between t-1 and t+h, so use t-1
+            selection_shift = 1
         
-        # Create a time variable that accounts for the control period
-        reg_data['control_time'] = reg_data[self.time] - control_shift
+        # Create a time variable that accounts for the selection period
+        reg_data['selection_time'] = reg_data[self.time] - selection_shift
         
-        # Merge with original data to get the condition values at control time
-        control_data = self.data[[self.unit, self.time] + [col for col in self.data.columns 
-                                                          if col not in [self.unit, self.time]]].copy()
-        control_data = control_data.rename(columns={self.time: 'control_time'})
+        # Merge with original data to get the condition values at selection time
+        selection_data = self.data[[self.unit, self.time] + [col for col in self.data.columns 
+                                                            if col not in [self.unit, self.time]]].copy()
+        selection_data = selection_data.rename(columns={self.time: 'selection_time'})
         
-        # Merge to get values at control time
+        # Merge to get values at selection time
         reg_data = reg_data.merge(
-            control_data[[self.unit, 'control_time'] + [col for col in control_data.columns 
-                                                        if col not in [self.unit, 'control_time', 'D_treat']]],
-            on=[self.unit, 'control_time'],
+            selection_data[[self.unit, 'selection_time'] + [col for col in selection_data.columns 
+                                                           if col not in [self.unit, 'selection_time', 'D_treat']]],
+            on=[self.unit, 'selection_time'],
             how='left',
-            suffixes=('', '_control')
+            suffixes=('', '_selection')
         )
         
-        # Apply the selection condition using values at control time
+        # Apply the selection condition using values at selection time
         try:
-            # Replace variable names in the condition with their control-time values
+            # Replace variable names in the condition with their selection-time values
+            # Use regex to ensure we only replace whole words, not parts of words
+            import re
             condition = self.min_time_selection
             for col in self.data.columns:
-                if col not in [self.unit, self.time, 'D_treat'] and f'{col}_control' in reg_data.columns:
-                    condition = condition.replace(col, f'{col}_control')
+                if col not in [self.unit, self.time, 'D_treat'] and f'{col}_selection' in reg_data.columns:
+                    # Use word boundaries to ensure we only replace complete variable names
+                    pattern = r'\b' + re.escape(col) + r'\b'
+                    replacement = f'{col}_selection'
+                    condition = re.sub(pattern, replacement, condition)
             
             # Evaluate the condition
             mask = reg_data.eval(condition)
@@ -1019,8 +1039,68 @@ class LPDiD:
             warnings.warn(f"Failed to apply min_time_selection condition '{self.min_time_selection}': {e}")
         
         # Clean up temporary columns
-        control_cols = [col for col in reg_data.columns if col.endswith('_control')]
-        reg_data = reg_data.drop(columns=control_cols + ['control_time'])
+        selection_cols = [col for col in reg_data.columns if col.endswith('_selection')]
+        reg_data = reg_data.drop(columns=selection_cols + ['selection_time'])
+        
+        return reg_data
+
+    def _apply_min_time_controls(self, reg_data, horizon, is_pre=False):
+        """Apply min_time_controls logic to use control variables from the earlier period
+        
+        When min_time_controls=True, control variables are drawn from the earlier
+        of the two periods in the long-difference:
+        - For post-treatment (t-1 to t+h): controls from t-1
+        - For pre-treatment (t-h to t-1): controls from t-h
+        """
+        if not self.min_time_controls:
+            return reg_data
+        
+        # Determine the control period (earlier of the two periods in long-difference)
+        if is_pre:
+            # For pre-treatment: difference is between t-h and t-1, so use t-h
+            control_shift = horizon
+        else:
+            # For post-treatment: difference is between t-1 and t+h, so use t-1
+            control_shift = 1
+        
+        # Create a time variable that accounts for the control period
+        reg_data['control_time'] = reg_data[self.time] - control_shift
+        
+        # Get list of all control variables and fixed effects to shift
+        vars_to_shift = self.controls.copy()
+        
+        # Also handle fixed effects that aren't time-based
+        fe_vars_to_shift = [fe for fe in self.absorb if fe != self.time]
+        vars_to_shift.extend(fe_vars_to_shift)
+        
+        # Only proceed if there are variables to shift
+        if vars_to_shift:
+            # Merge with original data to get the control values at control time
+            control_cols = [self.unit, self.time] + vars_to_shift
+            # Filter to only include columns that exist in the data
+            control_cols = [col for col in control_cols if col in self.data.columns]
+            
+            control_data = self.data[control_cols].copy()
+            control_data = control_data.rename(columns={self.time: 'control_time'})
+            
+            # Merge to get values at control time
+            reg_data = reg_data.merge(
+                control_data,
+                on=[self.unit, 'control_time'],
+                how='left',
+                suffixes=('_current', '_control')
+            )
+            
+            # Replace current values with control period values
+            for var in vars_to_shift:
+                if f'{var}_control' in reg_data.columns:
+                    reg_data[var] = reg_data[f'{var}_control']
+                    reg_data = reg_data.drop(columns=[f'{var}_control'])
+                if f'{var}_current' in reg_data.columns:
+                    reg_data = reg_data.drop(columns=[f'{var}_current'])
+        
+        # Clean up control_time column
+        reg_data = reg_data.drop(columns=['control_time'])
         
         return reg_data
 
@@ -1069,8 +1149,13 @@ class LPDiD:
         if reg_data.shape[0] == 0:
             return None
         
+        # Apply min_time_controls logic if specified
+        reg_data = self._apply_min_time_controls(reg_data, horizon, is_pre)
+        
         # Build formula
+        # Ensure unique fixed effects (avoid duplicates)
         fe_vars = [self.time] + self.absorb
+        fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
         formula = self._build_regression_formula(y_var, fe_vars)
         
         # Set up clustering
@@ -1152,9 +1237,18 @@ class LPDiD:
                             if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
                                 results[f'{clean_var}_{val}_p'] = fit.pvalue().loc[coef_name]
                             if hasattr(fit, 'confint'):
-                                ci = fit.confint().loc[coef_name]
-                                results[f'{clean_var}_{val}_ci_low'] = ci.iloc[0]
-                                results[f'{clean_var}_{val}_ci_high'] = ci.iloc[1]
+                                try:
+                                    ci = fit.confint()
+                                    if coef_name in ci.index:
+                                        ci_row = ci.loc[coef_name]
+                                        if hasattr(ci_row, 'iloc'):
+                                            results[f'{clean_var}_{val}_ci_low'] = ci_row.iloc[0]
+                                            results[f'{clean_var}_{val}_ci_high'] = ci_row.iloc[1]
+                                        else:
+                                            results[f'{clean_var}_{val}_ci_low'] = ci_row[0]
+                                            results[f'{clean_var}_{val}_ci_high'] = ci_row[1]
+                                except Exception:
+                                    pass  # Skip CI if extraction fails
                             
                             # Use first group for backward compatibility main columns
                             if not first_group_found:
@@ -1166,9 +1260,18 @@ class LPDiD:
                                 if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
                                     results['p'] = fit.pvalue().loc[coef_name]
                                 if hasattr(fit, 'confint'):
-                                    ci = fit.confint().loc[coef_name]
-                                    results['ci_low'] = ci.iloc[0]
-                                    results['ci_high'] = ci.iloc[1]
+                                    try:
+                                        ci = fit.confint()
+                                        if coef_name in ci.index:
+                                            ci_row = ci.loc[coef_name]
+                                            if hasattr(ci_row, 'iloc'):
+                                                results['ci_low'] = ci_row.iloc[0]
+                                                results['ci_high'] = ci_row.iloc[1]
+                                            else:
+                                                results['ci_low'] = ci_row[0]
+                                                results['ci_high'] = ci_row[1]
+                                    except Exception:
+                                        pass  # Skip CI if extraction fails
                                 first_group_found = True
                 
                 # If no groups were found, set NaN values
@@ -1219,9 +1322,18 @@ class LPDiD:
                         if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
                             results['se'] = fit.se().loc['D_treat']
                         if hasattr(fit, 'confint'):
-                            ci = fit.confint().loc['D_treat']
-                            results['ci_low'] = ci.iloc[0]
-                            results['ci_high'] = ci.iloc[1]
+                            try:
+                                ci = fit.confint()
+                                if 'D_treat' in ci.index:
+                                    ci_row = ci.loc['D_treat']
+                                    if hasattr(ci_row, 'iloc'):
+                                        results['ci_low'] = ci_row.iloc[0]
+                                        results['ci_high'] = ci_row.iloc[1]
+                                    else:
+                                        results['ci_low'] = ci_row[0]
+                                        results['ci_high'] = ci_row[1]
+                            except Exception:
+                                pass  # Skip CI if extraction fails
                             
                     except Exception as e:
                         warnings.warn(f"Wild bootstrap failed, using analytical inference: {e}")
@@ -1233,9 +1345,18 @@ class LPDiD:
                         if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
                             results['p'] = fit.pvalue().loc['D_treat']
                         if hasattr(fit, 'confint'):
-                            ci = fit.confint().loc['D_treat']
-                            results['ci_low'] = ci.iloc[0]
-                            results['ci_high'] = ci.iloc[1]
+                            try:
+                                ci = fit.confint()
+                                if 'D_treat' in ci.index:
+                                    ci_row = ci.loc['D_treat']
+                                    if hasattr(ci_row, 'iloc'):
+                                        results['ci_low'] = ci_row.iloc[0]
+                                        results['ci_high'] = ci_row.iloc[1]
+                                    else:
+                                        results['ci_low'] = ci_row[0]
+                                        results['ci_high'] = ci_row[1]
+                            except Exception:
+                                pass  # Skip CI if extraction fails
                 else:
                     # Use analytical standard errors
                     if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
@@ -1245,9 +1366,18 @@ class LPDiD:
                     if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
                         results['p'] = fit.pvalue().loc['D_treat']
                     if hasattr(fit, 'confint'):
-                        ci = fit.confint().loc['D_treat']
-                        results['ci_low'] = ci.iloc[0]
-                        results['ci_high'] = ci.iloc[1]
+                        try:
+                            ci = fit.confint()
+                            if 'D_treat' in ci.index:
+                                ci_row = ci.loc['D_treat']
+                                if hasattr(ci_row, 'iloc'):
+                                    results['ci_low'] = ci_row.iloc[0]
+                                    results['ci_high'] = ci_row.iloc[1]
+                                else:
+                                    results['ci_low'] = ci_row[0]
+                                    results['ci_high'] = ci_row[1]
+                        except Exception:
+                            pass  # Skip CI if extraction fails
             
             return results
             
@@ -1272,7 +1402,7 @@ class LPDiD:
             An object containing the estimated event-study coefficients and other relevant information.
         """
         print("\n" + "="*60)
-        print("Starting LP-DiD Estimation")
+        print("Starting LP-DiD Estimation (Linear Model)")
         print("="*60)
         
         # Step 1: Identify units that are never treated to serve as clean controls.
@@ -1423,6 +1553,80 @@ class LPDiDPois(LPDiD):
     Suitable for count data and binary outcomes.
     """
     
+    def _print_init_info(self):
+        """Print initialization information including parallel processing details"""
+        print("\n" + "="*60)
+        print("LP-DiD Initialization (Poisson Model)")
+        print("="*60)
+        
+        # Basic info
+        print(f"\nModel Information:")
+        print(f"  Model type: Poisson regression")
+        print(f"  Dependent variable: {self.depvar}")
+        print(f"  Unit identifier: {self.unit}")
+        print(f"  Time identifier: {self.time}")
+        print(f"  Treatment indicator: {self.treat}")
+        print(f"  Pre-treatment window: {self.pre_window}")
+        print(f"  Post-treatment window: {self.post_window}")
+        
+        # Parallel processing info
+        if self.n_jobs == -1:
+            actual_cores = multiprocessing.cpu_count()
+        else:
+            actual_cores = min(self.n_jobs, multiprocessing.cpu_count())
+        
+        total_regressions = (self.pre_window - 1) + (self.post_window + 1)
+        
+        print(f"\nParallel Processing Configuration:")
+        print(f"  System: {platform.system()} {platform.machine()}")
+        print(f"  Available CPU cores: {multiprocessing.cpu_count()}")
+        print(f"  Cores to be used: {actual_cores}")
+        print(f"  Total regressions to run: {total_regressions}")
+        
+        # Show multiprocessing configuration
+        current_mp_method = multiprocessing.get_start_method()
+        print(f"  Multiprocessing start method: {current_mp_method}")
+        if self.mp_type and self.mp_type != current_mp_method:
+            print(f"  Requested mp_type: {self.mp_type} (differs from current method)")
+        
+        # Additional options
+        if self.controls:
+            print(f"\nControl variables: {', '.join(self.controls)}")
+        if self.absorb:
+            print(f"Fixed effects: {', '.join(self.absorb)}")
+        if self.cluster_vars:
+            print(f"Clustering variables: {', '.join(self.cluster_vars)}")
+        if self.wildbootstrap:
+            print(f"Wild bootstrap iterations: {self.wildbootstrap}")
+        if self.nevertreated:
+            print("Using only never-treated units as controls")
+        
+        print("="*60 + "\n")
+    
+    def fit(self):
+        """
+        Fit the Local Projections Difference-in-Differences (LP-DiD) model using Poisson regression.
+
+        This method executes the full LP-DiD estimation pipeline:
+        1. Identifies clean control units that are never treated.
+        2. Constructs long-differenced outcomes for each horizon.
+        3. Computes weights for the regression if specified.
+        4. Runs separate Poisson regressions for each pre- and post-treatment horizon.
+        5. Collates the results into an `LPDiDResults` object.
+
+        Returns
+        -------
+        LPDiDResults
+            An object containing the estimated event-study coefficients and other relevant information.
+        """
+        print("\n" + "="*60)
+        print("Starting LP-DiD Estimation (Poisson Model)")
+        print("="*60)
+        
+        # Call the parent fit method which handles all the logic
+        # but will use our overridden _run_single_regression method for Poisson
+        return super().fit()
+    
     def _run_single_regression(self, horizon, is_pre=False):
         """Run a single LP-DiD regression using Poisson regression"""
         # Determine variables
@@ -1458,7 +1662,9 @@ class LPDiDPois(LPDiD):
             reg_data[y_var] = np.maximum(reg_data[y_var], 0)
         
         # Build formula
+        # Ensure unique fixed effects (avoid duplicates)
         fe_vars = [self.time] + self.absorb
+        fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
         formula = self._build_regression_formula(y_var, fe_vars)
         
         # Set up clustering
@@ -1540,9 +1746,18 @@ class LPDiDPois(LPDiD):
                             if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
                                 results[f'{clean_var}_{val}_p'] = fit.pvalue().loc[coef_name]
                             if hasattr(fit, 'confint'):
-                                ci = fit.confint().loc[coef_name]
-                                results[f'{clean_var}_{val}_ci_low'] = ci.iloc[0]
-                                results[f'{clean_var}_{val}_ci_high'] = ci.iloc[1]
+                                try:
+                                    ci = fit.confint()
+                                    if coef_name in ci.index:
+                                        ci_row = ci.loc[coef_name]
+                                        if hasattr(ci_row, 'iloc'):
+                                            results[f'{clean_var}_{val}_ci_low'] = ci_row.iloc[0]
+                                            results[f'{clean_var}_{val}_ci_high'] = ci_row.iloc[1]
+                                        else:
+                                            results[f'{clean_var}_{val}_ci_low'] = ci_row[0]
+                                            results[f'{clean_var}_{val}_ci_high'] = ci_row[1]
+                                except Exception:
+                                    pass  # Skip CI if extraction fails
                             
                             # Use first group for backward compatibility main columns
                             if not first_group_found:
@@ -1554,9 +1769,18 @@ class LPDiDPois(LPDiD):
                                 if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
                                     results['p'] = fit.pvalue().loc[coef_name]
                                 if hasattr(fit, 'confint'):
-                                    ci = fit.confint().loc[coef_name]
-                                    results['ci_low'] = ci.iloc[0]
-                                    results['ci_high'] = ci.iloc[1]
+                                    try:
+                                        ci = fit.confint()
+                                        if coef_name in ci.index:
+                                            ci_row = ci.loc[coef_name]
+                                            if hasattr(ci_row, 'iloc'):
+                                                results['ci_low'] = ci_row.iloc[0]
+                                                results['ci_high'] = ci_row.iloc[1]
+                                            else:
+                                                results['ci_low'] = ci_row[0]
+                                                results['ci_high'] = ci_row[1]
+                                    except Exception:
+                                        pass  # Skip CI if extraction fails
                                 first_group_found = True
                 
                 # If no groups were found, set NaN values
@@ -1592,9 +1816,18 @@ class LPDiDPois(LPDiD):
                 if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
                     results['p'] = fit.pvalue().loc['D_treat']
                 if hasattr(fit, 'confint'):
-                    ci = fit.confint().loc['D_treat']
-                    results['ci_low'] = ci.iloc[0]
-                    results['ci_high'] = ci.iloc[1]
+                    try:
+                        ci = fit.confint()
+                        if 'D_treat' in ci.index:
+                            ci_row = ci.loc['D_treat']
+                            if hasattr(ci_row, 'iloc'):
+                                results['ci_low'] = ci_row.iloc[0]
+                                results['ci_high'] = ci_row.iloc[1]
+                            else:
+                                results['ci_low'] = ci_row[0]
+                                results['ci_high'] = ci_row[1]
+                    except Exception:
+                        pass  # Skip CI if extraction fails
             
             return results
             

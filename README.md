@@ -17,6 +17,7 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 - **Reweighting options**: Variance-weighted or equally-weighted ATEs
 - **Pre-mean differencing**: Alternative baseline specifications
 - **Sample Weights**: Permits sample weights to allow for matching/PSM/CEM
+- **Poisson estimation**: LPDiDPois for count data and log-linear models
 
 ## Installation
 
@@ -322,6 +323,30 @@ lpdid_combined = LPDiD(
 - `swap_pre_diff=True`: For pre-treatment periods, computes `y_t-1 - y_t+h` instead of `y_t+h - y_t-1`
 - Supports conditions like `'alive==1'`, `'status>0'`, `'employed==True'`
 
+### Poisson Estimation (LPDiDPois)
+
+For count data or when you need log-linear models:
+
+```python
+from LPDiD import LPDiDPois
+
+# Poisson LP-DiD for count outcomes
+lpdid_pois = LPDiDPois(
+    data=data,
+    depvar='event_count',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    n_jobs=-1
+)
+
+results_pois = lpdid_pois.fit()
+results_pois.summary()
+```
+
 ## Main Parameters
 
 - `data`: Panel DataFrame
@@ -343,6 +368,7 @@ lpdid_combined = LPDiD(
 - `pmd`: Pre-mean differencing specification
 - `min_time_controls`: Use min(t-1, t+h) for control periods (default: False)
 - `min_time_selection`: Boolean condition for unit inclusion at control periods
+- `swap_pre_diff`: Swap pre-treatment difference direction (default: False)
 - `wildbootstrap`: Number of wild bootstrap iterations
 - `weights`: Weight variable
 - `n_jobs`: Number of parallel jobs

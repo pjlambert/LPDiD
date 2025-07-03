@@ -85,3 +85,4 @@ venv.bak/
 *.dta
 temp/
 output/
+internal_tests/

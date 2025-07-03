@@ -10,7 +10,7 @@ readme = "README.md"
 authors = [
     {name = "Peter John Lambert", email = "p.j.lambert@lse.ac.uk"}
 ]
-license = "MIT"
+license = {text = "MIT"}
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -27,7 +27,6 @@ dependencies = [
     "numpy>=1.19.0",
     "pandas>=1.1.0",
     "pyfixest>=0.18.0",
-    "matplotlib>=3.3.0",
     "scipy>=1.5.0",
     "joblib>=1.0.0",
 ]
@@ -44,10 +43,10 @@ dev = [
 all = ["LPDiD[wildbootstrap,dev]"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/LPDiD"
-Documentation = "https://github.com/yourusername/LPDiD/blob/main/README.md"
-Repository = "https://github.com/yourusername/LPDiD.git"
-Issues = "https://github.com/yourusername/LPDiD/issues"
+Homepage = "https://github.com/peterlambert/LPDiD"
+Documentation = "https://github.com/peterlambert/LPDiD/blob/main/README.md"
+Repository = "https://github.com/peterlambert/LPDiD.git"
+Issues = "https://github.com/peterlambert/LPDiD/issues"
 
 [tool.setuptools]
 packages = ["LPDiD"]
@@ -57,7 +56,7 @@ line-length = 100
 target-version = ['py37', 'py38', 'py39', 'py310', 'py311']
 
 [tool.pytest.ini_options]
-testpaths = ["test_lpdid.py"]
+testpaths = ["internal_tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
