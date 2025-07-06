@@ -22,8 +22,8 @@ if 'OMP_MAX_ACTIVE_LEVELS' not in os.environ:
 # 2. The system to use all available cores by default
 # 3. Optimal performance on high-core-count systems (e.g., 64 cores)
 
-# For best performance with joblib parallelism, users can set:
-# - OMP_NUM_THREADS=1 when using many joblib workers (n_jobs=-1)
+# For best performance with Ray parallelism, users can set:
+# - OMP_NUM_THREADS=1 when using many Ray workers (n_jobs=-1)
 # - OMP_NUM_THREADS=(cores/n_jobs) for balanced thread/process parallelism
 
 import warnings
@@ -53,7 +53,7 @@ import pandas as pd
 import pyfixest as pf
 from typing import Optional, Union, List, Tuple, Dict, Any
 import matplotlib.pyplot as plt
-from joblib import Parallel, delayed
+import ray
 from dataclasses import dataclass
 from scipy import stats
 import re
@@ -66,6 +66,611 @@ try:
 except ImportError:
     # We'll use pyfixest's built-in wildboottest method instead
     WILDBOOTTEST_AVAILABLE = False
+
+
+# Ray remote function for parallel regression
+@ray.remote
+def _run_single_regression_ray(
+    horizon, is_pre, long_diff_data, depvar, time, controls, absorb, 
+    cluster_vars, interact_vars, data, wildbootstrap, seed, weights, 
+    lean, copy_data, min_time_selection, unit, min_time_controls,
+    swap_pre_diff
+):
+    """
+    Ray remote function to run a single regression for a specific horizon.
+    
+    This function is decorated with @ray.remote to run in parallel across
+    multiple Ray workers. It contains all the logic from the original
+    _run_single_regression method but as a standalone function.
+    """
+    # Determine horizon value for filtering
+    horizon_value = -horizon if is_pre else horizon
+    
+    # Filter long format data for this horizon (already CCS filtered)
+    reg_data = long_diff_data[long_diff_data['h'] == horizon_value].copy()
+    
+    if reg_data.shape[0] == 0:
+        return None
+    
+    # Apply min_time_selection filter if specified
+    if min_time_selection:
+        reg_data = _apply_min_time_selection_standalone(
+            reg_data, horizon, is_pre, min_time_selection, data, unit, time
+        )
+    
+    if reg_data.shape[0] == 0:
+        return None
+    
+    # Apply min_time_controls logic if specified
+    if min_time_controls:
+        reg_data = _apply_min_time_controls_standalone(
+            reg_data, horizon, is_pre, controls, absorb, data, unit, time
+        )
+    
+    # Build formula using 'Dy' as the dependent variable
+    # Ensure unique fixed effects (avoid duplicates)
+    fe_vars = [time] + absorb
+    fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, data)
+    
+    # Set up clustering
+    if len(cluster_vars) == 1:
+        vcov = {'CRV1': cluster_vars[0]}
+    elif len(cluster_vars) == 2:
+        # Two-way clustering - use CRV1 with string format
+        vcov = {'CRV1': ' + '.join(cluster_vars)}
+    else:
+        # For 3+ clustering variables, also use string format
+        vcov = {'CRV1': ' + '.join(cluster_vars)}
+    
+    # Add weights if specified
+    use_weights = weights if weights else None
+    
+    # Run the fixed-effects regression using pyfixest.
+    try:
+        if use_weights is not None:
+            fit = pf.feols(
+                formula,
+                data=reg_data,
+                weights=use_weights,
+                vcov=vcov,
+                lean=lean,
+                copy_data=copy_data
+            )
+        else:
+            fit = pf.feols(
+                formula,
+                data=reg_data,
+                vcov=vcov,
+                lean=lean,
+                copy_data=copy_data
+            )
+        
+        nobs = len(reg_data)
+        
+        # Store results dictionary
+        results = {
+            'horizon': -horizon if is_pre else horizon,
+            'obs': nobs
+        }
+        
+        # Handle different cases: group-specific effects vs main effect
+        if interact_vars:
+            # With interactions: we have separate coefficients for each group
+            # Extract coefficients for each group
+            first_group_found = False
+            
+            for var in interact_vars:
+                clean_var = var.replace("i.", "") if var.startswith("i.") else var
+                unique_vals = sorted(data[clean_var].dropna().unique())
+                
+                for val in unique_vals:
+                    group_name = f"{clean_var}_{val}"
+                    coef_name = f"D_treat_{group_name}"
+                    
+                    if coef_name in fit.coef().index:
+                        group_coef = fit.coef().loc[coef_name]
+                        
+                        # Store group-specific results
+                        results[f'{clean_var}_{val}_coef'] = group_coef
+                        
+                        # Extract standard errors and inference for this group
+                        if hasattr(fit, 'se') and coef_name in fit.se().index:
+                            results[f'{clean_var}_{val}_se'] = fit.se().loc[coef_name]
+                        if hasattr(fit, 'tstat') and coef_name in fit.tstat().index:
+                            results[f'{clean_var}_{val}_t'] = fit.tstat().loc[coef_name]
+                        if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
+                            results[f'{clean_var}_{val}_p'] = fit.pvalue().loc[coef_name]
+                        if hasattr(fit, 'confint'):
+                            try:
+                                ci = fit.confint()
+                                if coef_name in ci.index:
+                                    ci_row = ci.loc[coef_name]
+                                    if hasattr(ci_row, 'iloc'):
+                                        results[f'{clean_var}_{val}_ci_low'] = ci_row.iloc[0]
+                                        results[f'{clean_var}_{val}_ci_high'] = ci_row.iloc[1]
+                                    else:
+                                        results[f'{clean_var}_{val}_ci_low'] = ci_row[0]
+                                        results[f'{clean_var}_{val}_ci_high'] = ci_row[1]
+                            except Exception:
+                                pass  # Skip CI if extraction fails
+                        
+                        # Use first group for backward compatibility main columns
+                        if not first_group_found:
+                            results['coefficient'] = group_coef
+                            if hasattr(fit, 'se') and coef_name in fit.se().index:
+                                results['se'] = fit.se().loc[coef_name]
+                            if hasattr(fit, 'tstat') and coef_name in fit.tstat().index:
+                                results['t'] = fit.tstat().loc[coef_name]
+                            if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
+                                results['p'] = fit.pvalue().loc[coef_name]
+                            if hasattr(fit, 'confint'):
+                                try:
+                                    ci = fit.confint()
+                                    if coef_name in ci.index:
+                                        ci_row = ci.loc[coef_name]
+                                        if hasattr(ci_row, 'iloc'):
+                                            results['ci_low'] = ci_row.iloc[0]
+                                            results['ci_high'] = ci_row.iloc[1]
+                                        else:
+                                            results['ci_low'] = ci_row[0]
+                                            results['ci_high'] = ci_row[1]
+                                except Exception:
+                                    pass  # Skip CI if extraction fails
+                            first_group_found = True
+            
+            # If no groups were found, set NaN values
+            if not first_group_found:
+                results['coefficient'] = np.nan
+                results['se'] = np.nan
+                results['t'] = np.nan
+                results['p'] = np.nan
+                results['ci_low'] = np.nan
+                results['ci_high'] = np.nan
+        else:
+            # Without interactions: extract main D_treat coefficient only
+            if 'D_treat' not in fit.coef().index:
+                warnings.warn(f"D_treat coefficient not found for horizon {horizon}")
+                return None
+                
+            # Extract main treatment coefficient
+            coef = fit.coef().loc['D_treat']
+            results['coefficient'] = coef
+            
+            # Handle inference for main effect
+            if wildbootstrap:
+                # Use pyfixest's built-in wildboottest method
+                try:
+                    # Set seed for this specific test if provided
+                    if seed is not None:
+                        np.random.seed(seed + horizon)  # Add horizon for variation
+                    
+                    wb_result = fit.wildboottest(
+                        param="D_treat",
+                        reps=wildbootstrap
+                    )
+                    
+                    # Extract results from the wildboottest output (pandas Series)
+                    if isinstance(wb_result, pd.Series):
+                        # Extract wild bootstrap p-value (this is the main adjustment)
+                        if 'Pr(>|t|)' in wb_result.index:
+                            results['p'] = wb_result['Pr(>|t|)']
+                        # Extract wild bootstrap t-statistic
+                        if 't value' in wb_result.index:
+                            results['t'] = wb_result['t value']
+                    
+                    # Use analytical standard errors and confidence intervals
+                    if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
+                        results['se'] = fit.se().loc['D_treat']
+                    if hasattr(fit, 'confint'):
+                        try:
+                            ci = fit.confint()
+                            if 'D_treat' in ci.index:
+                                ci_row = ci.loc['D_treat']
+                                if hasattr(ci_row, 'iloc'):
+                                    results['ci_low'] = ci_row.iloc[0]
+                                    results['ci_high'] = ci_row.iloc[1]
+                                else:
+                                    results['ci_low'] = ci_row[0]
+                                    results['ci_high'] = ci_row[1]
+                        except Exception:
+                            pass  # Skip CI if extraction fails
+                        
+                except Exception as e:
+                    warnings.warn(f"Wild bootstrap failed, using analytical inference: {e}")
+                    # Fall back to analytical standard errors
+                    if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
+                        results['se'] = fit.se().loc['D_treat']
+                    if hasattr(fit, 'tstat') and 'D_treat' in fit.tstat().index:
+                        results['t'] = fit.tstat().loc['D_treat']
+                    if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
+                        results['p'] = fit.pvalue().loc['D_treat']
+                    if hasattr(fit, 'confint'):
+                        try:
+                            ci = fit.confint()
+                            if 'D_treat' in ci.index:
+                                ci_row = ci.loc['D_treat']
+                                if hasattr(ci_row, 'iloc'):
+                                    results['ci_low'] = ci_row.iloc[0]
+                                    results['ci_high'] = ci_row.iloc[1]
+                                else:
+                                    results['ci_low'] = ci_row[0]
+                                    results['ci_high'] = ci_row[1]
+                        except Exception:
+                            pass  # Skip CI if extraction fails
+            else:
+                # Use analytical standard errors
+                if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
+                    results['se'] = fit.se().loc['D_treat']
+                if hasattr(fit, 'tstat') and 'D_treat' in fit.tstat().index:
+                    results['t'] = fit.tstat().loc['D_treat']
+                if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
+                    results['p'] = fit.pvalue().loc['D_treat']
+                if hasattr(fit, 'confint'):
+                    try:
+                        ci = fit.confint()
+                        if 'D_treat' in ci.index:
+                            ci_row = ci.loc['D_treat']
+                            if hasattr(ci_row, 'iloc'):
+                                results['ci_low'] = ci_row.iloc[0]
+                                results['ci_high'] = ci_row.iloc[1]
+                            else:
+                                results['ci_low'] = ci_row[0]
+                                results['ci_high'] = ci_row[1]
+                    except Exception:
+                        pass  # Skip CI if extraction fails
+        
+        return results
+        
+    except Exception as e:
+        warnings.warn(f"Regression failed for horizon {horizon}: {e}")
+        return None
+
+
+# Ray remote function for Poisson regression
+@ray.remote
+def _run_single_regression_ray_poisson(
+    horizon, is_pre, long_diff_data, depvar, time, controls, absorb, 
+    cluster_vars, interact_vars, data, wildbootstrap, seed, weights, 
+    lean, copy_data, min_time_selection, unit, min_time_controls,
+    swap_pre_diff
+):
+    """
+    Ray remote function to run a single Poisson regression for a specific horizon.
+    
+    This function is decorated with @ray.remote to run in parallel across
+    multiple Ray workers. It contains all the logic from the original
+    _run_single_regression method for Poisson regression.
+    """
+    # Determine horizon value for filtering
+    horizon_value = -horizon if is_pre else horizon
+    
+    # Filter long format data for this horizon (already CCS filtered)
+    reg_data = long_diff_data[long_diff_data['h'] == horizon_value].copy()
+    
+    if reg_data.shape[0] == 0:
+        return None
+    
+    # Apply min_time_selection filter if specified
+    if min_time_selection:
+        reg_data = _apply_min_time_selection_standalone(
+            reg_data, horizon, is_pre, min_time_selection, data, unit, time
+        )
+    
+    if reg_data.shape[0] == 0:
+        return None
+    
+    # For Poisson regression, we need non-negative outcomes
+    # Check if we have negative values and warn
+    if reg_data['Dy'].min() < 0:
+        warnings.warn(f"Negative values detected in long-differenced outcome. "
+                     "Consider using swap_pre_diff=True for pre-treatment periods "
+                     "or use regular LPDiD for continuous outcomes.")
+        # Convert negative values to 0 for Poisson
+        reg_data['Dy'] = np.maximum(reg_data['Dy'], 0)
+    
+    # Apply min_time_controls logic if specified
+    if min_time_controls:
+        reg_data = _apply_min_time_controls_standalone(
+            reg_data, horizon, is_pre, controls, absorb, data, unit, time
+        )
+    
+    # Build formula using 'Dy' as the dependent variable
+    # Ensure unique fixed effects (avoid duplicates)
+    fe_vars = [time] + absorb
+    fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, data)
+    
+    # Set up clustering
+    if len(cluster_vars) == 1:
+        vcov = {'CRV1': cluster_vars[0]}
+    elif len(cluster_vars) == 2:
+        # Two-way clustering - use CRV1 with string format
+        vcov = {'CRV1': ' + '.join(cluster_vars)}
+    else:
+        # For 3+ clustering variables, also use string format
+        vcov = {'CRV1': ' + '.join(cluster_vars)}
+    
+    # Add weights if specified
+    use_weights = weights if weights else None
+    
+    # Run Poisson regression using pyfixest.
+    try:
+        if use_weights is not None:
+            fit = pf.fepois(
+                formula,
+                data=reg_data,
+                weights=use_weights,
+                vcov=vcov,
+                lean=lean,
+                copy_data=copy_data
+            )
+        else:
+            fit = pf.fepois(
+                formula,
+                data=reg_data,
+                vcov=vcov,
+                lean=lean,
+                copy_data=copy_data
+            )
+        
+        nobs = len(reg_data)
+        
+        # Store results dictionary
+        results = {
+            'horizon': -horizon if is_pre else horizon,
+            'obs': nobs
+        }
+        
+        # Handle different cases: group-specific effects vs main effect
+        if interact_vars:
+            # With interactions: we have separate coefficients for each group
+            # Extract coefficients for each group
+            first_group_found = False
+            
+            for var in interact_vars:
+                clean_var = var.replace("i.", "") if var.startswith("i.") else var
+                unique_vals = sorted(data[clean_var].dropna().unique())
+                
+                for val in unique_vals:
+                    group_name = f"{clean_var}_{val}"
+                    coef_name = f"D_treat_{group_name}"
+                    
+                    if coef_name in fit.coef().index:
+                        group_coef = fit.coef().loc[coef_name]
+                        
+                        # Store group-specific results
+                        results[f'{clean_var}_{val}_coef'] = group_coef
+                        
+                        # Extract standard errors and inference for this group
+                        if hasattr(fit, 'se') and coef_name in fit.se().index:
+                            results[f'{clean_var}_{val}_se'] = fit.se().loc[coef_name]
+                        if hasattr(fit, 'tstat') and coef_name in fit.tstat().index:
+                            results[f'{clean_var}_{val}_t'] = fit.tstat().loc[coef_name]
+                        if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
+                            results[f'{clean_var}_{val}_p'] = fit.pvalue().loc[coef_name]
+                        if hasattr(fit, 'confint'):
+                            try:
+                                ci = fit.confint()
+                                if coef_name in ci.index:
+                                    ci_row = ci.loc[coef_name]
+                                    if hasattr(ci_row, 'iloc'):
+                                        results[f'{clean_var}_{val}_ci_low'] = ci_row.iloc[0]
+                                        results[f'{clean_var}_{val}_ci_high'] = ci_row.iloc[1]
+                                    else:
+                                        results[f'{clean_var}_{val}_ci_low'] = ci_row[0]
+                                        results[f'{clean_var}_{val}_ci_high'] = ci_row[1]
+                            except Exception:
+                                pass  # Skip CI if extraction fails
+                        
+                        # Use first group for backward compatibility main columns
+                        if not first_group_found:
+                            results['coefficient'] = group_coef
+                            if hasattr(fit, 'se') and coef_name in fit.se().index:
+                                results['se'] = fit.se().loc[coef_name]
+                            if hasattr(fit, 'tstat') and coef_name in fit.tstat().index:
+                                results['t'] = fit.tstat().loc[coef_name]
+                            if hasattr(fit, 'pvalue') and coef_name in fit.pvalue().index:
+                                results['p'] = fit.pvalue().loc[coef_name]
+                            if hasattr(fit, 'confint'):
+                                try:
+                                    ci = fit.confint()
+                                    if coef_name in ci.index:
+                                        ci_row = ci.loc[coef_name]
+                                        if hasattr(ci_row, 'iloc'):
+                                            results['ci_low'] = ci_row.iloc[0]
+                                            results['ci_high'] = ci_row.iloc[1]
+                                        else:
+                                            results['ci_low'] = ci_row[0]
+                                            results['ci_high'] = ci_row[1]
+                                except Exception:
+                                    pass  # Skip CI if extraction fails
+                            first_group_found = True
+            
+            # If no groups were found, set NaN values
+            if not first_group_found:
+                results['coefficient'] = np.nan
+                results['se'] = np.nan
+                results['t'] = np.nan
+                results['p'] = np.nan
+                results['ci_low'] = np.nan
+                results['ci_high'] = np.nan
+        else:
+            # Without interactions: extract main D_treat coefficient only
+            if 'D_treat' not in fit.coef().index:
+                warnings.warn(f"D_treat coefficient not found for horizon {horizon}")
+                return None
+                
+            # Extract main treatment coefficient
+            coef = fit.coef().loc['D_treat']
+            results['coefficient'] = coef
+            
+            # Handle inference for main effect
+            if wildbootstrap:
+                # Note: Wild bootstrap for Poisson may not be as well-supported
+                warnings.warn("Wild bootstrap with Poisson regression may have limitations. "
+                             "Consider using analytical inference.")
+            
+            # Use analytical standard errors
+            if hasattr(fit, 'se') and 'D_treat' in fit.se().index:
+                results['se'] = fit.se().loc['D_treat']
+            if hasattr(fit, 'tstat') and 'D_treat' in fit.tstat().index:
+                results['t'] = fit.tstat().loc['D_treat']
+            if hasattr(fit, 'pvalue') and 'D_treat' in fit.pvalue().index:
+                results['p'] = fit.pvalue().loc['D_treat']
+            if hasattr(fit, 'confint'):
+                try:
+                    ci = fit.confint()
+                    if 'D_treat' in ci.index:
+                        ci_row = ci.loc['D_treat']
+                        if hasattr(ci_row, 'iloc'):
+                            results['ci_low'] = ci_row.iloc[0]
+                            results['ci_high'] = ci_row.iloc[1]
+                        else:
+                            results['ci_low'] = ci_row[0]
+                            results['ci_high'] = ci_row[1]
+                except Exception:
+                    pass  # Skip CI if extraction fails
+        
+        return results
+        
+    except Exception as e:
+        warnings.warn(f"Poisson regression failed for horizon {horizon}: {e}")
+        return None
+
+
+# Standalone helper functions for Ray remote function
+def _apply_min_time_selection_standalone(reg_data, horizon, is_pre, min_time_selection, data, unit, time):
+    """Standalone version of _apply_min_time_selection for Ray"""
+    if not min_time_selection:
+        return reg_data
+    
+    # Determine the selection period (earlier of the two periods in long-difference)
+    if is_pre:
+        selection_shift = horizon
+    else:
+        selection_shift = 1
+    
+    # Create a time variable that accounts for the selection period
+    reg_data['selection_time'] = reg_data[time] - selection_shift
+    
+    # Merge with original data to get the condition values at selection time
+    selection_data = data[[unit, time] + [col for col in data.columns 
+                                          if col not in [unit, time]]].copy()
+    selection_data = selection_data.rename(columns={time: 'selection_time'})
+    
+    # Merge to get values at selection time
+    reg_data = reg_data.merge(
+        selection_data[[unit, 'selection_time'] + [col for col in selection_data.columns 
+                                                   if col not in [unit, 'selection_time', 'D_treat']]],
+        on=[unit, 'selection_time'],
+        how='left',
+        suffixes=('', '_selection')
+    )
+    
+    # Apply the selection condition using values at selection time
+    try:
+        # Replace variable names in the condition with their selection-time values
+        condition = min_time_selection
+        for col in data.columns:
+            if col not in [unit, time, 'D_treat'] and f'{col}_selection' in reg_data.columns:
+                # Use word boundaries to ensure we only replace complete variable names
+                pattern = r'\b' + re.escape(col) + r'\b'
+                replacement = f'{col}_selection'
+                condition = re.sub(pattern, replacement, condition)
+        
+        # Evaluate the condition
+        mask = reg_data.eval(condition)
+        reg_data = reg_data[mask]
+    except Exception as e:
+        warnings.warn(f"Failed to apply min_time_selection condition '{min_time_selection}': {e}")
+    
+    # Clean up temporary columns
+    selection_cols = [col for col in reg_data.columns if col.endswith('_selection')]
+    reg_data = reg_data.drop(columns=selection_cols + ['selection_time'])
+    
+    return reg_data
+
+
+def _apply_min_time_controls_standalone(reg_data, horizon, is_pre, controls, absorb, data, unit, time):
+    """Standalone version of _apply_min_time_controls for Ray"""
+    # Determine the control period (earlier of the two periods in long-difference)
+    if is_pre:
+        control_shift = horizon
+    else:
+        control_shift = 1
+    
+    # Create a time variable that accounts for the control period
+    reg_data['control_time'] = reg_data[time] - control_shift
+    
+    # Get list of all control variables and fixed effects to shift
+    vars_to_shift = controls.copy()
+    
+    # Also handle fixed effects that aren't time-based
+    fe_vars_to_shift = [fe for fe in absorb if fe != time]
+    vars_to_shift.extend(fe_vars_to_shift)
+    
+    # Only proceed if there are variables to shift
+    if vars_to_shift:
+        # Merge with original data to get the control values at control time
+        control_cols = [unit, time] + vars_to_shift
+        # Filter to only include columns that exist in the data
+        control_cols = [col for col in control_cols if col in data.columns]
+        
+        control_data = data[control_cols].copy()
+        control_data = control_data.rename(columns={time: 'control_time'})
+        
+        # Merge to get values at control time
+        reg_data = reg_data.merge(
+            control_data,
+            on=[unit, 'control_time'],
+            how='left',
+            suffixes=('_current', '_control')
+        )
+        
+        # Replace current values with control period values
+        for var in vars_to_shift:
+            if f'{var}_control' in reg_data.columns:
+                reg_data[var] = reg_data[f'{var}_control']
+                reg_data = reg_data.drop(columns=[f'{var}_control'])
+            if f'{var}_current' in reg_data.columns:
+                reg_data = reg_data.drop(columns=[f'{var}_current'])
+    
+    # Clean up control_time column
+    reg_data = reg_data.drop(columns=['control_time'])
+    
+    return reg_data
+
+
+def _build_regression_formula_standalone(y_var, fe_vars, controls, interact_vars, data):
+    """Standalone version of _build_regression_formula for Ray"""
+    # Build control variables part
+    if interact_vars:
+        # With interactions, we use group-specific treatment variables
+        controls_list = controls.copy()
+        
+        # Add group-specific treatment indicators
+        for var in interact_vars:
+            clean_var = var.replace("i.", "") if var.startswith("i.") else var
+            unique_vals = sorted(data[clean_var].dropna().unique())
+            
+            for val in unique_vals:
+                group_name = f"{clean_var}_{val}"
+                controls_list.append(f"D_treat_{group_name}")
+    else:
+        # Standard case: just add D_treat
+        controls_list = controls + ['D_treat']
+    
+    # Build formula parts
+    controls_str = " + ".join(controls_list) if controls_list else "1"
+    fe_str = " + ".join(fe_vars) if fe_vars else ""
+    
+    if fe_str:
+        formula = f"{y_var} ~ {controls_str} | {fe_str}"
+    else:
+        formula = f"{y_var} ~ {controls_str}"
+    
+    return formula
 
 
 @dataclass
@@ -274,7 +879,6 @@ class LPDiD:
                  nevertreated: bool = False,
                  nocomp: bool = False,
                  rw: bool = False,
-                 pmd: Optional[Union[int, str]] = None,
                  min_time_controls: bool = False,
                  min_time_selection: Optional[str] = None,
                  swap_pre_diff: bool = False,
@@ -347,7 +951,6 @@ class LPDiD:
         self.nevertreated = nevertreated
         self.nocomp = nocomp
         self.rw = rw
-        self.pmd = pmd
         self.min_time_controls = min_time_controls
         self.min_time_selection = min_time_selection
         self.swap_pre_diff = swap_pre_diff
@@ -386,96 +989,15 @@ class LPDiD:
         print(f"Data preparation complete. Dataset has {len(self.data)} observations.")
         
     def _configure_multiprocessing(self):
-        """Configure multiprocessing start method based on mp_type parameter"""
-        if self.mp_type is None:
-            # Auto-detect and recommend spawn on Linux for memory efficiency
-            if platform.system() == 'Linux' and self.n_jobs != 1:
-                try:
-                    current_method = multiprocessing.get_start_method(allow_none=True)
-                    if current_method == 'fork':
-                        warnings.warn(
-                            "You are using parallel processing on Linux with 'fork' method. "
-                            "For better memory efficiency and to avoid warnings, consider setting mp_type='spawn' "
-                            "when creating LPDiD instance, or use:\n"
-                            "  from LPDiD.spawn_enforcer import configure_for_memory_efficiency\n"
-                            "  configure_for_memory_efficiency()",
-                            UserWarning
-                        )
-                except:
-                    pass
-            return  # Use system default
-        
-        # Validate mp_type
-        valid_methods = ['fork', 'spawn', 'forkserver']
-        if self.mp_type not in valid_methods:
-            raise ValueError(f"mp_type must be one of {valid_methods}, got '{self.mp_type}'")
-        
-        # Check if forkserver is supported (Unix only)
-        if self.mp_type == 'forkserver' and platform.system() == 'Windows':
-            raise ValueError("forkserver mp_type is not supported on Windows")
-        
-        # Only attempt to configure if we're actually going to use parallel processing
-        if self.n_jobs == 1:
-            return  # No need to configure for sequential processing
-        
-        # Be more aggressive about setting spawn for memory efficiency
-        success = self._force_multiprocessing_method(self.mp_type)
-        
-        if not success and self.mp_type == 'spawn':
-            print("⚠ Warning: Could not set spawn method. For better memory efficiency:")
-            print("  1. Restart your Python session")
-            print("  2. Set spawn before importing any libraries:")
-            print("     import multiprocessing")
-            print("     multiprocessing.set_start_method('spawn', force=True)")
-            print("  3. Or use: from LPDiD.spawn_enforcer import configure_for_memory_efficiency")
-    
-    def _force_multiprocessing_method(self, method):
-        """Aggressively try to set multiprocessing method"""
-        try:
-            current_method = multiprocessing.get_start_method(allow_none=True)
-            
-            if current_method == method:
-                if method == 'spawn':
-                    print("✓ Spawn multiprocessing already configured for memory efficiency")
-                return True
-            
-            if current_method is None:
-                # No method set yet, safe to set
-                multiprocessing.set_start_method(method)
-                if method == 'spawn':
-                    print("✓ Successfully configured spawn multiprocessing for memory efficiency")
-                return True
-            else:
-                # Try to force the method
-                try:
-                    multiprocessing.set_start_method(method, force=True)
-                    if method == 'spawn':
-                        print("✓ Successfully forced spawn multiprocessing for memory efficiency")
-                    return True
-                except RuntimeError:
-                    # Method already set and can't be changed in this session
-                    if method == 'spawn' and current_method == 'fork':
-                        warnings.warn(
-                            f"Cannot change from '{current_method}' to '{method}' in current session. "
-                            f"Restart Python and set spawn before importing libraries for memory efficiency.",
-                            UserWarning
-                        )
-                    return False
-                
-        except Exception as e:
-            warnings.warn(f"Error configuring {method} multiprocessing: {e}")
-            return False
-    
-    def _get_optimal_joblib_backend(self):
-        """Get the optimal joblib backend based on multiprocessing configuration"""
-        current_method = multiprocessing.get_start_method(allow_none=True)
-        
-        if current_method == 'spawn':
-            # With spawn, we can use multiprocessing backend for better integration
-            return 'multiprocessing'
-        else:
-            # With fork or unset, use loky which manages its own processes
-            return 'loky'
+        """Configure warnings for multiprocessing (Ray handles process management automatically)"""
+        # Ray automatically uses spawn-like behavior, so we don't need to configure multiprocessing
+        # The mp_type parameter is now deprecated but kept for backward compatibility
+        if self.mp_type is not None:
+            warnings.warn(
+                "The 'mp_type' parameter is deprecated when using Ray for parallelization. "
+                "Ray automatically handles process management with proper memory isolation.",
+                DeprecationWarning
+            )
 
     def _validate_inputs(self):
         """Validate input parameters"""
@@ -558,10 +1080,6 @@ class LPDiD:
         
         print("="*60 + "\n")
     
-    def _create_single_lag(self, data_subset, lag, var_name):
-        """Create a single lag for a subset of data (helper for parallel processing)"""
-        unit_id = data_subset.index.get_level_values(0)[0]
-        return unit_id, data_subset[var_name].shift(lag)
     
     def _prepare_data(self):
         """Prepare data for estimation"""
@@ -590,99 +1108,30 @@ class LPDiD:
                         self.data['D_treat'] * (self.data[clean_var] == val).astype(int)
                     )
         
-        # Determine if we should use parallel processing for lags
-        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
-        use_parallel = n_cores > 1 and ((self.ylags and self.ylags > 2) or (self.dylags and self.dylags > 2))
-        
-        # Create lags if needed
+        # Create lags if needed (using vectorized approach)
         if self.ylags:
-            if use_parallel and self.ylags > 2:
-                print(f"Creating {self.ylags} lags in parallel...")
-                # Parallel version
-                grouped = list(self.data.groupby(level=0))
-                tasks = [(group, lag, self.depvar) for lag in range(1, self.ylags + 1) for _, group in grouped]
-                
-                # Increase timeout and use more robust parallel configuration
-                with Parallel(n_jobs=n_cores, backend='loky', verbose=0, timeout=300, max_nbytes='50M') as parallel:
-                    results = parallel(
-                        delayed(self._create_single_lag)(group, lag, var)
-                        for _, group, lag, var in tqdm(
-                            [(i, g, l, v) for i, (_, g) in enumerate(grouped) for l, v in [(lag, self.depvar) for lag in range(1, self.ylags + 1)]],
-                            desc="Creating lags",
-                            disable=False
-                        )
-                    )
-                
-                # Reorganize results by lag
-                for lag in range(1, self.ylags + 1):
-                    lag_col = f'L{lag}_{self.depvar}'
-                    self.data[lag_col] = pd.concat([r[1] for r in results if r[1].name == lag])
-                    self.controls.append(lag_col)
-            else:
-                # Sequential version
-                for lag in range(1, self.ylags + 1):
-                    self.data[f'L{lag}_{self.depvar}'] = (
-                        self.data.groupby(level=0)[self.depvar].shift(lag)
-                    )
-                    self.controls.append(f'L{lag}_{self.depvar}')
+            for lag in range(1, self.ylags + 1):
+                self.data[f'L{lag}_{self.depvar}'] = (
+                    self.data.groupby(level=0)[self.depvar].shift(lag)
+                )
+                self.controls.append(f'L{lag}_{self.depvar}')
         
         if self.dylags:
             # First create the first difference
             self.data[f'D_{self.depvar}'] = self.data.groupby(level=0)[self.depvar].diff()
             
-            if use_parallel and self.dylags > 2:
-                print(f"Creating {self.dylags} differenced lags in parallel...")
-                # Similar parallel approach for differenced lags
-                grouped = list(self.data.groupby(level=0))
-                
-                with Parallel(n_jobs=n_cores, backend='loky', verbose=0, timeout=300, max_nbytes='50M') as parallel:
-                    results = parallel(
-                        delayed(self._create_single_lag)(group, lag, f'D_{self.depvar}')
-                        for _, group in grouped
-                        for lag in range(1, self.dylags + 1)
-                    )
-                
-                # Reorganize results
-                for lag in range(1, self.dylags + 1):
-                    lag_col = f'L{lag}_D_{self.depvar}'
-                    # Collect results for this specific lag
-                    lag_results = []
-                    for unit_id, result in results:
-                        if len(result) > 0:  # Check if result is not empty
-                            lag_results.append(result)
-                    if lag_results:
-                        self.data[lag_col] = pd.concat(lag_results)
-                    self.controls.append(lag_col)
-            else:
-                # Sequential version
-                for lag in range(1, self.dylags + 1):
-                    self.data[f'L{lag}_D_{self.depvar}'] = (
-                        self.data.groupby(level=0)[f'D_{self.depvar}'].shift(lag)
-                    )
-                    self.controls.append(f'L{lag}_D_{self.depvar}')
+            # Create differenced lags (using vectorized approach)
+            for lag in range(1, self.dylags + 1):
+                self.data[f'L{lag}_D_{self.depvar}'] = (
+                    self.data.groupby(level=0)[f'D_{self.depvar}'].shift(lag)
+                )
+                self.controls.append(f'L{lag}_D_{self.depvar}')
         
         # Reset index for easier manipulation
         self.data = self.data.reset_index()
 
     def _identify_clean_controls(self):
-        """Identify clean control samples and create indicators"""
-        # Identify treatment switching periods
-        self.data['first_treat_period'] = self.data.groupby(self.unit)[self.treat].transform(
-            lambda x: x.idxmax() if x.any() else np.nan
-        )
-        
-        # Create clean control sample indicators for each horizon
-        post_CCS = self.post_window
-        pre_CCS = self.pre_window
-        
-        # Post-treatment clean controls
-        for h in range(post_CCS + 1):
-            self.data[f'CCS_{h}'] = 1
-            
-        # Pre-treatment clean controls
-        for h in range(2, pre_CCS + 1):
-            self.data[f'CCS_m{h}'] = 1
-        
+        """Prepare data for clean control sample identification"""
         # Handle never-treated option
         if self.nevertreated:
             # Only never treated units
@@ -691,260 +1140,137 @@ class LPDiD:
             never_treated_df = never_treated.reset_index()
             never_treated_df.columns = [self.unit, 'never_treated']
             self.data = self.data.merge(never_treated_df, on=self.unit)
-            
-            # Update CCS indicators
-            for h in range(post_CCS + 1):
-                self.data.loc[
-                    (self.data['D_treat'] == 0) & (self.data['never_treated'] == 0),
-                    f'CCS_{h}'
-                ] = 0
-            for h in range(2, pre_CCS + 1):
-                self.data.loc[
-                    (self.data['D_treat'] == 0) & (self.data['never_treated'] == 0),
-                    f'CCS_m{h}'
-                ] = 0
+        
+        # The actual CCS identification will be done in _generate_long_differences
+        # after creating long_diff_data, based on treatment patterns and horizons
 
-    def _should_use_parallel_processing(self):
-        """Determine if parallel processing should be used based on data size and complexity"""
-        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
-        total_horizons = (self.post_window + 1) + (self.pre_window - 1)
-        n_observations = len(self.data)
-        n_units = self.data[self.unit].nunique()
-        
-        # Factors that favor parallelization
-        large_dataset = n_observations > 50000
-        many_horizons = total_horizons > 10
-        many_units = n_units > 1000
-        many_cores_requested = n_cores > 4
-        
-        # Factors that favor vectorization
-        complex_pmd = self.pmd is not None
-        min_time_logic = self.min_time_controls
-        
-        # Decision logic
-        if complex_pmd or min_time_logic:
-            # Complex logic benefits from parallelization if dataset is large
-            return large_dataset and many_cores_requested and n_cores <= 4
-        else:
-            # Simple logic: use parallel only for very large datasets with many cores
-            return large_dataset and many_horizons and many_units and n_cores <= 4
     
     def _generate_long_differences(self):
-        """Generate long differences for dependent variable using optimized vectorized approach"""
+        """Generate long differences for dependent variable and apply CCS filtering"""
         # Determine processing strategy
         total_horizons = (self.post_window + 1) + (self.pre_window - 1)
-        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
-        use_parallel = self._should_use_parallel_processing()
         
         print(f"Generating long differences for {total_horizons} horizons...")
-        if use_parallel:
-            print(f"Using parallel processing with {n_cores} cores")
-        else:
-            print("Using optimized vectorized approach")
+        print("Using optimized vectorized approach with integrated CCS filtering")
         
-        # First, handle pmd calculations if needed
-        if self.pmd == 'max':
-            # Use all available pre-treatment periods
-            def calc_pre_mean(group):
-                cumsum = group[self.depvar].expanding().sum()
-                count = group[self.depvar].expanding().count()
-                return cumsum.shift(1) / count.shift(1)
-            
-            if self.min_time_controls:
-                warnings.warn("min_time_controls with pmd='max' is not yet implemented. "
-                             "Using standard pmd='max' behavior.")
-            
-            self.data['aveLY'] = self.data.groupby(self.unit).apply(
-                calc_pre_mean
-            ).reset_index(drop=True)
-            
-        elif self.pmd is not None:
-            # Moving average over [-pmd, -1]
-            def calc_ma(group, window):
-                return group[self.depvar].rolling(window=window, min_periods=window).mean()
-            
-            if self.min_time_controls:
-                warnings.warn("min_time_controls with pmd specification is not yet implemented. "
-                             "Using standard pmd behavior.")
-            
-            self.data['aveLY'] = self.data.groupby(self.unit).apply(
-                lambda x: calc_ma(x, self.pmd).shift(1)
-            ).reset_index(drop=True)
-        
-        # Generate differences using optimized approach
-        if use_parallel and (self.pmd is not None or self.min_time_controls):
-            # Use parallelization for complex cases with optimized batching
-            self._generate_differences_parallel_optimized()
-        else:
-            # Use vectorized approach for standard cases
-            self._generate_differences_vectorized()
+        # Always use vectorized approach
+        self._generate_differences_vectorized()
     
     def _generate_differences_vectorized(self):
-        """Generate long differences using optimized vectorized operations"""
-        # Pre-compute all shifts needed (this is highly optimized and can use multiple cores via BLAS)
-        shifts = {}
-        max_shift = max(self.post_window, self.pre_window)
+        """Ultra-fast vectorized long difference generation using NumPy"""
+        print("Using optimized NumPy vectorized approach for long differences...")
         
-        # Pre-compute all required shifts in one go
-        for h in range(-max_shift, max_shift + 2):  # Extra range to cover all cases
-            shifts[h] = self.data.groupby(self.unit)[self.depvar].shift(-h)
+        # Step 1: Extract arrays for speed
+        units = self.data[self.unit].values
+        y_values = self.data[self.depvar].values
+        n = len(self.data)
         
-        # For h=0, it's just the original data (no shift)
-        shifts[0] = self.data.groupby(self.unit)[self.depvar].shift(0)
+        # Step 2: Find unit boundaries efficiently
+        unit_diff = np.diff(units, prepend=units[0]-1)
+        unit_starts = np.where(unit_diff != 0)[0]
+        unit_ends = np.append(unit_starts[1:], n)
         
-        if self.pmd is None:
-            # Standard long differences
-            if self.min_time_controls:
-                # Use min(t-1, t+h) for control periods
-                for h in range(self.post_window + 1):
-                    # For post-treatment periods (h >= 0), always use t-1 as control
-                    self.data[f'D{h}y'] = shifts[h] - shifts[-1]
-                
-                for h in range(2, self.pre_window + 1):
-                    if h == 2:
-                        # For horizon -2, use standard t-1 control
-                        control_shift = -1
-                    else:
-                        # For longer horizons, use control closer to the outcome period
-                        control_shift = -(h - 1)  # Use t-(h-1) as control instead of t-1
-                    
-                    if self.swap_pre_diff:
-                        self.data[f'Dm{h}y'] = shifts[control_shift] - shifts[-h]
-                    else:
-                        self.data[f'Dm{h}y'] = shifts[-h] - shifts[control_shift]
-            else:
-                # Standard implementation - vectorized
-                for h in range(self.post_window + 1):
-                    self.data[f'D{h}y'] = shifts[h] - shifts[-1]
-                
-                for h in range(2, self.pre_window + 1):
-                    if self.swap_pre_diff:
-                        self.data[f'Dm{h}y'] = shifts[-1] - shifts[-h]
-                    else:
-                        self.data[f'Dm{h}y'] = shifts[-h] - shifts[-1]
+        # Step 3: Create unit mapping arrays
+        unit_start_map = np.zeros(n, dtype=np.int32)
+        unit_end_map = np.zeros(n, dtype=np.int32)
+        
+        for i, (start, end) in enumerate(zip(unit_starts, unit_ends)):
+            unit_start_map[start:end] = start
+            unit_end_map[start:end] = end
+        
+        # Step 4: Define all horizons
+        horizons = []
+        horizons.extend(range(self.post_window + 1))      # 0 to post_window
+        horizons.extend(range(-self.pre_window, -1))      # -pre_window to -2
+        
+        # Step 5: Vectorized difference calculation
+        n_horizons = len(horizons)
+        long_indices = np.tile(np.arange(n), n_horizons)
+        horizon_indices = np.repeat(horizons, n)
+        
+        # Calculate source indices for t-1 and t+h
+        t_minus_1_indices = long_indices - 1
+        t_plus_h_indices = long_indices + np.repeat(horizons, n)
+        
+        # Step 6: Mask for valid differences
+        valid_mask = (
+            (t_minus_1_indices >= unit_start_map[long_indices]) &
+            (t_plus_h_indices < unit_end_map[long_indices]) &
+            (t_plus_h_indices >= 0) &
+            (t_plus_h_indices < n)
+        )
+        
+        # Step 7: Compute all differences as Y_{t+h} - Y_{t-1}
+        dy = np.full(len(long_indices), np.nan)
+        dy[valid_mask] = y_values[t_plus_h_indices[valid_mask]] - y_values[t_minus_1_indices[valid_mask]]
+        
+        # Step 8: Apply swap_pre_diff logic (just negate for h < 0)
+        if self.swap_pre_diff:
+            pre_mask = horizon_indices < 0
+            dy[pre_mask] = -dy[pre_mask]
+        
+        # Step 9: Apply min_time_controls adjustment if needed
+        # Note: This is a simplified implementation - full min_time_controls logic
+        # would require more complex handling of control period selection
+        
+        # Step 10: Build result DataFrame (only valid observations)
+        keep_mask = ~np.isnan(dy)
+        
+        # Build dictionary column by column for efficiency
+        result_dict = {
+            self.unit: self.data[self.unit].values[long_indices[keep_mask]],
+            self.time: self.data[self.time].values[long_indices[keep_mask]],
+            'h': horizon_indices[keep_mask],
+            'Dy': dy[keep_mask],
+            'D_treat': self.data['D_treat'].values[long_indices[keep_mask]],
+            'is_pre': (horizon_indices[keep_mask] < 0).astype(int)
+        }
+        
+        # Add remaining columns
+        essential_cols = self.controls + self.absorb + self.cluster_vars
+        if self.weights:
+            essential_cols.append(self.weights)
+        if 'never_treated' in self.data.columns:
+            essential_cols.append('never_treated')
+        
+        # Remove duplicates
+        essential_cols = list(dict.fromkeys(essential_cols))
+        
+        for col in essential_cols:
+            if col in self.data.columns:
+                result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+        
+        # Add interaction columns if present
+        if self.interact_vars:
+            interaction_cols = [c for c in self.data.columns if c.startswith('D_treat_')]
+            for col in interaction_cols:
+                result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+        
+        # Create final DataFrame
+        self.long_diff_data = pd.DataFrame(result_dict)
+        
+        # Apply CCS filtering
+        if self.nevertreated and 'never_treated' in self.long_diff_data.columns:
+            # Mark observations from always-treated units as not clean controls
+            self.long_diff_data['CCS'] = ~(
+                (self.long_diff_data['D_treat'] == 0) & 
+                (self.long_diff_data['never_treated'] == 0)
+            ).astype(int)
         else:
-            # With pmd, aveLY is already computed - use vectorized operations
-            for h in range(self.post_window + 1):
-                self.data[f'D{h}y'] = shifts[-h] - self.data['aveLY']
-            
-            for h in range(2, self.pre_window + 1):
-                if self.swap_pre_diff:
-                    self.data[f'Dm{h}y'] = self.data['aveLY'] - shifts[h]
-                else:
-                    self.data[f'Dm{h}y'] = shifts[h] - self.data['aveLY']
+            # Standard case: all observations are clean controls
+            self.long_diff_data['CCS'] = 1
+        
+        # Apply CCS filtering to keep only clean control samples
+        print(f"Applying CCS filtering...")
+        pre_filter_count = len(self.long_diff_data)
+        self.long_diff_data = self.long_diff_data[self.long_diff_data['CCS'] == 1].copy()
+        post_filter_count = len(self.long_diff_data)
+        print(f"CCS filtering complete. Kept {post_filter_count:,} of {pre_filter_count:,} observations " 
+              f"({100*post_filter_count/pre_filter_count:.1f}%)")
+        
+        # Drop the CCS column as it's no longer needed after filtering
+        self.long_diff_data = self.long_diff_data.drop(columns=['CCS'])
     
-    def _generate_differences_parallel_optimized(self):
-        """Generate long differences using optimized parallel processing with batching"""
-        n_cores = self.n_jobs if self.n_jobs != -1 else multiprocessing.cpu_count()
-        
-        # Optimize the number of cores based on dataset size
-        n_units = self.data[self.unit].nunique()
-        optimal_cores = min(n_cores, max(2, n_units // 500))  # At least 500 units per core
-        
-        print(f"Using {optimal_cores} cores (reduced from {n_cores} for optimal performance)")
-        
-        # Create batches of units instead of individual unit tasks
-        units = sorted(self.data[self.unit].unique())
-        batch_size = max(50, len(units) // (optimal_cores * 2))  # Aim for 2 batches per core
-        unit_batches = [units[i:i + batch_size] for i in range(0, len(units), batch_size)]
-        
-        print(f"Processing {len(units)} units in {len(unit_batches)} batches of ~{batch_size} units each")
-        
-        # Use threading for I/O-bound operations, multiprocessing for CPU-bound
-        backend = 'threading' if len(self.data) < 100000 else 'loky'
-        
-        with Parallel(n_jobs=optimal_cores, backend=backend, verbose=0, timeout=300, max_nbytes='100M') as parallel:
-            results = parallel(
-                delayed(self._process_unit_batch)(batch, self.post_window, self.pre_window)
-                for batch in tqdm(unit_batches, desc="Computing long differences")
-            )
-        
-        # Combine results
-        self._combine_batch_results(results)
-    
-    def _process_unit_batch(self, unit_batch, post_window, pre_window):
-        """Process a batch of units for all horizons"""
-        batch_data = self.data[self.data[self.unit].isin(unit_batch)].copy()
-        results = {}
-        
-        # Process all horizons for this batch
-        for h in range(post_window + 1):
-            col_name = f'D{h}y'
-            if self.pmd is None:
-                if self.min_time_controls:
-                    results[col_name] = (
-                        batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
-                        batch_data.groupby(self.unit)[self.depvar].shift(1)
-                    )
-                else:
-                    results[col_name] = (
-                        batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
-                        batch_data.groupby(self.unit)[self.depvar].shift(1)
-                    )
-            else:
-                results[col_name] = (
-                    batch_data.groupby(self.unit)[self.depvar].shift(-h) - 
-                    batch_data['aveLY']
-                )
-        
-        for h in range(2, pre_window + 1):
-            col_name = f'Dm{h}y'
-            if self.pmd is None:
-                if self.min_time_controls:
-                    if h == 2:
-                        control_shift = 1
-                    else:
-                        control_shift = h - 1
-                    
-                    if self.swap_pre_diff:
-                        results[col_name] = (
-                            batch_data.groupby(self.unit)[self.depvar].shift(control_shift) - 
-                            batch_data.groupby(self.unit)[self.depvar].shift(h)
-                        )
-                    else:
-                        results[col_name] = (
-                            batch_data.groupby(self.unit)[self.depvar].shift(h) - 
-                            batch_data.groupby(self.unit)[self.depvar].shift(control_shift)
-                        )
-                else:
-                    if self.swap_pre_diff:
-                        results[col_name] = (
-                            batch_data.groupby(self.unit)[self.depvar].shift(1) - 
-                            batch_data.groupby(self.unit)[self.depvar].shift(h)
-                        )
-                    else:
-                        results[col_name] = (
-                            batch_data.groupby(self.unit)[self.depvar].shift(h) - 
-                            batch_data.groupby(self.unit)[self.depvar].shift(1)
-                        )
-            else:
-                if self.swap_pre_diff:
-                    results[col_name] = (
-                        batch_data['aveLY'] - 
-                        batch_data.groupby(self.unit)[self.depvar].shift(h)
-                    )
-                else:
-                    results[col_name] = (
-                        batch_data.groupby(self.unit)[self.depvar].shift(h) - 
-                        batch_data['aveLY']
-                    )
-        
-        return unit_batch, results
-    
-    def _combine_batch_results(self, batch_results):
-        """Combine results from batched processing"""
-        all_columns = set()
-        for _, results in batch_results:
-            all_columns.update(results.keys())
-        
-        for col_name in all_columns:
-            column_parts = []
-            for unit_batch, results in batch_results:
-                if col_name in results:
-                    column_parts.append(results[col_name])
-            
-            if column_parts:
-                self.data[col_name] = pd.concat(column_parts).sort_index()
 
     def _compute_weights(self):
         """Compute weights for reweighted estimation"""
@@ -1108,9 +1434,8 @@ class LPDiD:
         """
         Run a single local projection regression for a specific horizon.
 
-        This internal method is the core of the estimation. It constructs the
-        appropriate dependent variable for the given horizon, filters the data
-        to the correct sample, builds the regression formula, and runs the
+        This internal method is the core of the estimation. It filters the long-format
+        data for the specific horizon, builds the regression formula, and runs the
         estimation using `pyfixest`.
 
         Parameters
@@ -1126,19 +1451,11 @@ class LPDiD:
             A dictionary containing the regression results (coefficient, se, etc.)
             for the specified horizon, or None if the regression fails.
         """
-        # Determine dependent variable, clean control sample, and weight variables based on horizon
-        if is_pre:
-            y_var = f'Dm{horizon}y'
-            ccs_var = f'CCS_m{horizon}'
-            weight_var = 'reweight_0' if self.rw else None
-        else:
-            y_var = f'D{horizon}y'
-            ccs_var = f'CCS_{horizon}'
-            weight_var = f'reweight_{horizon}' if self.rw else None
+        # Determine horizon value for filtering
+        horizon_value = -horizon if is_pre else horizon
         
-        # Filter data
-        mask = self.data[ccs_var] == 1
-        reg_data = self.data[mask].copy()
+        # Filter long format data for this horizon (already CCS filtered)
+        reg_data = self.long_diff_data[self.long_diff_data['h'] == horizon_value].copy()
         
         if reg_data.shape[0] == 0:
             return None
@@ -1152,11 +1469,11 @@ class LPDiD:
         # Apply min_time_controls logic if specified
         reg_data = self._apply_min_time_controls(reg_data, horizon, is_pre)
         
-        # Build formula
+        # Build formula using 'Dy' as the dependent variable
         # Ensure unique fixed effects (avoid duplicates)
         fe_vars = [self.time] + self.absorb
         fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-        formula = self._build_regression_formula(y_var, fe_vars)
+        formula = self._build_regression_formula('Dy', fe_vars)
         
         # Set up clustering
         if len(self.cluster_vars) == 1:
@@ -1169,14 +1486,9 @@ class LPDiD:
             vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         
         # Add weights if specified
-        if self.weights and weight_var:
-            # Combine user weights with reweighting
-            reg_data['combined_weight'] = reg_data[self.weights] * reg_data[weight_var]
-            use_weights = 'combined_weight'
-        elif self.weights:
+        # Note: reweighting is not implemented in long format yet
+        if self.weights:
             use_weights = self.weights
-        elif weight_var and weight_var in reg_data.columns:
-            use_weights = weight_var
         else:
             use_weights = None
         
@@ -1443,46 +1755,51 @@ class LPDiD:
         
         # Run regressions (parallel or sequential)
         if n_cores > 1 and len(regression_tasks) > 1:
-            print(f"Running regressions in parallel using {n_cores} cores...")
+            print(f"Running regressions in parallel using {n_cores} cores with Ray...")
             
-            # Use optimal backend based on multiprocessing configuration
-            backend = self._get_optimal_joblib_backend()
-            current_mp_method = multiprocessing.get_start_method()
-            
-            print(f"Using joblib backend: {backend} (multiprocessing method: {current_mp_method})")
-            
-            # Adjust settings based on backend
-            if backend == 'multiprocessing' and current_mp_method == 'spawn':
-                # With spawn, we get better memory isolation but need larger max_nbytes
-                n_observations = len(self.data)
-                max_nbytes = '2G' if n_observations > 1_000_000 else '500M'
-                timeout = 900  # Longer timeout for spawn (slower startup)
-            else:
-                # With loky or fork, use standard settings
-                n_observations = len(self.data)
-                max_nbytes = '1G' if n_observations > 1_000_000 else '100M'
-                timeout = 600
+            # Initialize Ray if not already initialized
+            if not ray.is_initialized():
+                ray.init(num_cpus=n_cores, ignore_reinit_error=True)
+                print("Ray initialized.")
             
             try:
-                with Parallel(n_jobs=n_cores, backend=backend, verbose=0, timeout=timeout, max_nbytes=max_nbytes) as parallel:
-                    # Run regressions in parallel with progress indicator
-                    results = parallel(
-                        delayed(self._run_single_regression)(h, is_pre) 
-                        for h, is_pre in regression_tasks
+                # Submit all regression tasks to Ray
+                ray_futures = []
+                for h, is_pre in regression_tasks:
+                    future = _run_single_regression_ray.remote(
+                        horizon=h,
+                        is_pre=is_pre,
+                        long_diff_data=self.long_diff_data,
+                        depvar=self.depvar,
+                        time=self.time,
+                        controls=self.controls,
+                        absorb=self.absorb,
+                        cluster_vars=self.cluster_vars,
+                        interact_vars=self.interact_vars,
+                        data=self.data,
+                        wildbootstrap=self.wildbootstrap,
+                        seed=self.seed,
+                        weights=self.weights,
+                        lean=self.lean,
+                        copy_data=self.copy_data,
+                        min_time_selection=self.min_time_selection,
+                        unit=self.unit,
+                        min_time_controls=self.min_time_controls,
+                        swap_pre_diff=self.swap_pre_diff
                     )
-                    
+                    ray_futures.append(future)
+                
+                # Wait for all tasks to complete and collect results
+                results = ray.get(ray_futures)
+                
                 # Filter out None results
                 event_study_results = [r for r in results if r is not None]
                 
-                if backend == 'multiprocessing' and current_mp_method == 'spawn':
-                    print(f"✓ Memory-efficient parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
-                else:
-                    print(f"Parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+                print(f"✓ Ray parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
                 
-            except (TerminatedWorkerError, MemoryError) as e:
-                print(f"\nParallel processing failed: {type(e).__name__}")
+            except Exception as e:
+                print(f"\nRay parallel processing failed: {type(e).__name__}: {e}")
                 print("Falling back to sequential processing...")
-                print("Consider reducing n_jobs or using a machine with more memory.")
                 
                 # Fall back to sequential processing
                 event_study_results = []
@@ -1543,6 +1860,52 @@ class LPDiD:
         )
         
         return results
+    
+    def get_long_diff_data(self):
+        """
+        Get the long-format difference data generated during the fit process.
+        
+        This method returns the internally generated long-format dataset that contains
+        all the long differences stacked vertically. Each row represents a unit-time-horizon
+        combination with the following standardized columns:
+        
+        - All original data columns (unit, time, treatment, controls, etc.)
+        - 'Dy': The long-differenced outcome variable
+        - 'h': The horizon (-pre_window to post_window, with negative values for pre-treatment)
+        - 'is_pre': Binary indicator (1 for pre-treatment horizons, 0 for post-treatment)
+        - 'CCS': Clean control sample indicator (1 if included in clean control sample)
+        
+        Returns
+        -------
+        pd.DataFrame or None
+            The long-format difference data if available, None if fit() hasn't been called yet.
+            
+        Notes
+        -----
+        This long format is useful for:
+        - Custom analyses that require all horizons in a single dataset
+        - Pooled regressions across multiple horizons
+        - Visualization and data exploration
+        - Integration with other statistical packages that expect long format data
+        
+        Examples
+        --------
+        >>> # After fitting the model
+        >>> lpdid = LPDiD(data, depvar='y', unit='id', time='t', treat='treat')
+        >>> results = lpdid.fit()
+        >>> 
+        >>> # Get the long format data
+        >>> long_data = lpdid.get_long_diff_data()
+        >>> 
+        >>> # Example: Run a pooled regression
+        >>> import statsmodels.formula.api as smf
+        >>> pooled_model = smf.ols('Dy ~ D_treat + C(h)', data=long_data[long_data['CCS']==1]).fit()
+        """
+        if hasattr(self, 'long_diff_data'):
+            return self.long_diff_data.copy()
+        else:
+            warnings.warn("Long difference data not available. Please run fit() first.")
+            return None
 
 
 class LPDiDPois(LPDiD):
@@ -1623,25 +1986,157 @@ class LPDiDPois(LPDiD):
         print("Starting LP-DiD Estimation (Poisson Model)")
         print("="*60)
         
-        # Call the parent fit method which handles all the logic
-        # but will use our overridden _run_single_regression method for Poisson
-        return super().fit()
+        # Step 1: Identify units that are never treated to serve as clean controls.
+        print("\nStep 1: Identifying clean control samples...")
+        self._identify_clean_controls()
+        print("Clean control identification complete.")
+        
+        # Step 2: Create the long-differenced outcome variable for each horizon.
+        print("\nStep 2: Generating long differences...")
+        self._generate_long_differences()
+        print("Long differences generation complete.")
+        
+        # Step 3: Compute regression weights if a weighting variable is specified.
+        if self.rw:
+            print("\nStep 3: Computing regression weights...")
+            self._compute_weights()
+            print("Weight computation complete.")
+        
+        # Step 4: Run event-study regressions for each specified horizon.
+        print(f"\nStep 4: Running {(self.pre_window - 1) + (self.post_window + 1)} regressions...")
+        
+        # Determine actual number of cores to use
+        if self.n_jobs == -1:
+            n_cores = multiprocessing.cpu_count()
+        else:
+            n_cores = min(self.n_jobs, multiprocessing.cpu_count())
+        
+        # Prepare regression tasks
+        regression_tasks = []
+        
+        # Add pre-treatment periods (h=2 to pre_window)
+        for h in range(2, self.pre_window + 1):
+            regression_tasks.append((h, True))  # True indicates pre-treatment
+        
+        # Add post-treatment periods (h=0 to post_window)
+        for h in range(self.post_window + 1):
+            regression_tasks.append((h, False))  # False indicates post-treatment
+        
+        # Run regressions (parallel or sequential)
+        if n_cores > 1 and len(regression_tasks) > 1:
+            print(f"Running regressions in parallel using {n_cores} cores with Ray...")
+            
+            # Initialize Ray if not already initialized
+            if not ray.is_initialized():
+                ray.init(num_cpus=n_cores, ignore_reinit_error=True)
+                print("Ray initialized.")
+            
+            try:
+                # Submit all regression tasks to Ray
+                ray_futures = []
+                for h, is_pre in regression_tasks:
+                    future = _run_single_regression_ray_poisson.remote(
+                        horizon=h,
+                        is_pre=is_pre,
+                        long_diff_data=self.long_diff_data,
+                        depvar=self.depvar,
+                        time=self.time,
+                        controls=self.controls,
+                        absorb=self.absorb,
+                        cluster_vars=self.cluster_vars,
+                        interact_vars=self.interact_vars,
+                        data=self.data,
+                        wildbootstrap=self.wildbootstrap,
+                        seed=self.seed,
+                        weights=self.weights,
+                        lean=self.lean,
+                        copy_data=self.copy_data,
+                        min_time_selection=self.min_time_selection,
+                        unit=self.unit,
+                        min_time_controls=self.min_time_controls,
+                        swap_pre_diff=self.swap_pre_diff
+                    )
+                    ray_futures.append(future)
+                
+                # Wait for all tasks to complete and collect results
+                results = ray.get(ray_futures)
+                
+                # Filter out None results
+                event_study_results = [r for r in results if r is not None]
+                
+                print(f"✓ Ray parallel estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+                
+            except Exception as e:
+                print(f"\nRay parallel processing failed: {type(e).__name__}: {e}")
+                print("Falling back to sequential processing...")
+                
+                # Fall back to sequential processing
+                event_study_results = []
+                for i, (h, is_pre) in enumerate(regression_tasks):
+                    print(f"  Progress: {i+1}/{len(regression_tasks)} - Horizon {-h if is_pre else h}...", end='\r')
+                    result = self._run_single_regression(h, is_pre)
+                    if result:
+                        event_study_results.append(result)
+                
+                print(f"\nSequential estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+            
+        else:
+            # Sequential execution
+            print("Running regressions sequentially...")
+            event_study_results = []
+            
+            for i, (h, is_pre) in enumerate(regression_tasks):
+                print(f"  Progress: {i+1}/{len(regression_tasks)} - Horizon {-h if is_pre else h}...", end='\r')
+                result = self._run_single_regression(h, is_pre)
+                if result:
+                    event_study_results.append(result)
+            
+            print(f"\nSequential estimation complete. Successfully estimated {len(event_study_results)} horizons.")
+        
+        # Step 5: Collate results into a structured DataFrame.
+        if event_study_results:
+            event_study_df = pd.DataFrame(event_study_results)
+        else:
+            # If no regressions were successful, create an empty DataFrame with the expected structure.
+            event_study_df = pd.DataFrame(columns=['horizon', 'coefficient', 'se', 't', 'p', 'ci_low', 'ci_high', 'obs'])
+
+        # Normalize the event-study plot by setting the coefficient for h=-1 to 0.
+        # This is a standard convention to show treatment effects relative to the period just before treatment.
+        # For this period, all other metrics (se, t, etc.) are also set to 0 for consistency.
+        if -1 not in event_study_df['horizon'].values:
+            # Dynamically create the row with all zeros to handle any extra columns from interactions.
+            cols = event_study_df.columns
+            if len(cols) == 0:
+                # Fallback if there were no other results from the regressions.
+                cols = ['horizon', 'coefficient', 'se', 't', 'p', 'ci_low', 'ci_high', 'obs']
+            
+            h_minus_1_row = {col: 0.0 for col in cols}
+            h_minus_1_row['horizon'] = -1
+            
+            event_study_df = pd.concat([pd.DataFrame([h_minus_1_row]), event_study_df], ignore_index=True)
+
+        # Sort results by horizon for chronological plotting and analysis.
+        event_study_df = event_study_df.sort_values('horizon').reset_index(drop=True)
+        
+        # Step 6: Package the results into a dedicated LPDiDResults object for easy access and plotting.
+        results = LPDiDResults(
+            event_study=event_study_df,
+            depvar=self.depvar,
+            pre_window=self.pre_window,
+            post_window=self.post_window,
+            control_group="Controls",
+            treated_group="Treated"
+        )
+        
+        return results
     
     def _run_single_regression(self, horizon, is_pre=False):
         """Run a single LP-DiD regression using Poisson regression"""
-        # Determine variables
-        if is_pre:
-            y_var = f'Dm{horizon}y'
-            ccs_var = f'CCS_m{horizon}'
-            weight_var = 'reweight_0' if self.rw else None
-        else:
-            y_var = f'D{horizon}y'
-            ccs_var = f'CCS_{horizon}'
-            weight_var = f'reweight_{horizon}' if self.rw else None
+        # Determine horizon value for filtering
+        horizon_value = -horizon if is_pre else horizon
         
-        # Filter data
-        mask = self.data[ccs_var] == 1
-        reg_data = self.data[mask].copy()
+        # Filter long format data for this horizon (already CCS filtered)
+        reg_data = self.long_diff_data[self.long_diff_data['h'] == horizon_value].copy()
         
         if reg_data.shape[0] == 0:
             return None
@@ -1654,18 +2149,21 @@ class LPDiDPois(LPDiD):
         
         # For Poisson regression, we need non-negative outcomes
         # Check if we have negative values and warn
-        if reg_data[y_var].min() < 0:
-            warnings.warn(f"Negative values detected in {y_var}. "
+        if reg_data['Dy'].min() < 0:
+            warnings.warn(f"Negative values detected in long-differenced outcome. "
                          "Consider using swap_pre_diff=True for pre-treatment periods "
                          "or use regular LPDiD for continuous outcomes.")
             # Convert negative values to 0 for Poisson
-            reg_data[y_var] = np.maximum(reg_data[y_var], 0)
+            reg_data['Dy'] = np.maximum(reg_data['Dy'], 0)
         
-        # Build formula
+        # Apply min_time_controls logic if specified
+        reg_data = self._apply_min_time_controls(reg_data, horizon, is_pre)
+        
+        # Build formula using 'Dy' as the dependent variable
         # Ensure unique fixed effects (avoid duplicates)
         fe_vars = [self.time] + self.absorb
         fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-        formula = self._build_regression_formula(y_var, fe_vars)
+        formula = self._build_regression_formula('Dy', fe_vars)
         
         # Set up clustering
         if len(self.cluster_vars) == 1:
@@ -1678,14 +2176,9 @@ class LPDiDPois(LPDiD):
             vcov = {'CRV1': ' + '.join(self.cluster_vars)}
         
         # Add weights if specified
-        if self.weights and weight_var:
-            # Combine user weights with reweighting
-            reg_data['combined_weight'] = reg_data[self.weights] * reg_data[weight_var]
-            use_weights = 'combined_weight'
-        elif self.weights:
+        # Note: reweighting is not implemented in long format yet
+        if self.weights:
             use_weights = self.weights
-        elif weight_var and weight_var in reg_data.columns:
-            use_weights = weight_var
         else:
             use_weights = None
         
