@@ -72,9 +72,8 @@ except ImportError:
 @ray.remote
 def _run_single_regression_ray(
     horizon, is_pre, long_diff_data, depvar, time, controls, absorb, 
-    cluster_vars, interact_vars, data, wildbootstrap, seed, weights, 
-    lean, copy_data, min_time_selection, unit, min_time_controls,
-    swap_pre_diff
+    cluster_vars, interact_vars, wildbootstrap, seed, weights, 
+    lean, copy_data
 ):
     """
     Ray remote function to run a single regression for a specific horizon.
@@ -92,26 +91,11 @@ def _run_single_regression_ray(
     if reg_data.shape[0] == 0:
         return None
     
-    # Apply min_time_selection filter if specified
-    if min_time_selection:
-        reg_data = _apply_min_time_selection_standalone(
-            reg_data, horizon, is_pre, min_time_selection, data, unit, time
-        )
-    
-    if reg_data.shape[0] == 0:
-        return None
-    
-    # Apply min_time_controls logic if specified
-    if min_time_controls:
-        reg_data = _apply_min_time_controls_standalone(
-            reg_data, horizon, is_pre, controls, absorb, data, unit, time
-        )
-    
     # Build formula using 'Dy' as the dependent variable
     # Ensure unique fixed effects (avoid duplicates)
     fe_vars = [time] + absorb
     fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, data)
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data)
     
     # Set up clustering
     if len(cluster_vars) == 1:
@@ -146,7 +130,7 @@ def _run_single_regression_ray(
                 copy_data=copy_data
             )
         
-        nobs = len(reg_data)
+        nobs = fit._N
         
         # Store results dictionary
         results = {
@@ -331,9 +315,8 @@ def _run_single_regression_ray(
 @ray.remote
 def _run_single_regression_ray_poisson(
     horizon, is_pre, long_diff_data, depvar, time, controls, absorb, 
-    cluster_vars, interact_vars, data, wildbootstrap, seed, weights, 
-    lean, copy_data, min_time_selection, unit, min_time_controls,
-    swap_pre_diff
+    cluster_vars, interact_vars, wildbootstrap, seed, weights, 
+    lean, copy_data
 ):
     """
     Ray remote function to run a single Poisson regression for a specific horizon.
@@ -351,15 +334,6 @@ def _run_single_regression_ray_poisson(
     if reg_data.shape[0] == 0:
         return None
     
-    # Apply min_time_selection filter if specified
-    if min_time_selection:
-        reg_data = _apply_min_time_selection_standalone(
-            reg_data, horizon, is_pre, min_time_selection, data, unit, time
-        )
-    
-    if reg_data.shape[0] == 0:
-        return None
-    
     # For Poisson regression, we need non-negative outcomes
     # Check if we have negative values and warn
     if reg_data['Dy'].min() < 0:
@@ -369,17 +343,11 @@ def _run_single_regression_ray_poisson(
         # Convert negative values to 0 for Poisson
         reg_data['Dy'] = np.maximum(reg_data['Dy'], 0)
     
-    # Apply min_time_controls logic if specified
-    if min_time_controls:
-        reg_data = _apply_min_time_controls_standalone(
-            reg_data, horizon, is_pre, controls, absorb, data, unit, time
-        )
-    
     # Build formula using 'Dy' as the dependent variable
     # Ensure unique fixed effects (avoid duplicates)
     fe_vars = [time] + absorb
     fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, data)
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data)
     
     # Set up clustering
     if len(cluster_vars) == 1:
@@ -414,7 +382,7 @@ def _run_single_regression_ray_poisson(
                 copy_data=copy_data
             )
         
-        nobs = len(reg_data)
+        nobs = fit._N
         
         # Store results dictionary
         results = {
@@ -540,108 +508,6 @@ def _run_single_regression_ray_poisson(
 
 
 # Standalone helper functions for Ray remote function
-def _apply_min_time_selection_standalone(reg_data, horizon, is_pre, min_time_selection, data, unit, time):
-    """Standalone version of _apply_min_time_selection for Ray"""
-    if not min_time_selection:
-        return reg_data
-    
-    # Determine the selection period (earlier of the two periods in long-difference)
-    if is_pre:
-        selection_shift = horizon
-    else:
-        selection_shift = 1
-    
-    # Create a time variable that accounts for the selection period
-    reg_data['selection_time'] = reg_data[time] - selection_shift
-    
-    # Merge with original data to get the condition values at selection time
-    selection_data = data[[unit, time] + [col for col in data.columns 
-                                          if col not in [unit, time]]].copy()
-    selection_data = selection_data.rename(columns={time: 'selection_time'})
-    
-    # Merge to get values at selection time
-    reg_data = reg_data.merge(
-        selection_data[[unit, 'selection_time'] + [col for col in selection_data.columns 
-                                                   if col not in [unit, 'selection_time', 'D_treat']]],
-        on=[unit, 'selection_time'],
-        how='left',
-        suffixes=('', '_selection')
-    )
-    
-    # Apply the selection condition using values at selection time
-    try:
-        # Replace variable names in the condition with their selection-time values
-        condition = min_time_selection
-        for col in data.columns:
-            if col not in [unit, time, 'D_treat'] and f'{col}_selection' in reg_data.columns:
-                # Use word boundaries to ensure we only replace complete variable names
-                pattern = r'\b' + re.escape(col) + r'\b'
-                replacement = f'{col}_selection'
-                condition = re.sub(pattern, replacement, condition)
-        
-        # Evaluate the condition
-        mask = reg_data.eval(condition)
-        reg_data = reg_data[mask]
-    except Exception as e:
-        warnings.warn(f"Failed to apply min_time_selection condition '{min_time_selection}': {e}")
-    
-    # Clean up temporary columns
-    selection_cols = [col for col in reg_data.columns if col.endswith('_selection')]
-    reg_data = reg_data.drop(columns=selection_cols + ['selection_time'])
-    
-    return reg_data
-
-
-def _apply_min_time_controls_standalone(reg_data, horizon, is_pre, controls, absorb, data, unit, time):
-    """Standalone version of _apply_min_time_controls for Ray"""
-    # Determine the control period (earlier of the two periods in long-difference)
-    if is_pre:
-        control_shift = horizon
-    else:
-        control_shift = 1
-    
-    # Create a time variable that accounts for the control period
-    reg_data['control_time'] = reg_data[time] - control_shift
-    
-    # Get list of all control variables and fixed effects to shift
-    vars_to_shift = controls.copy()
-    
-    # Also handle fixed effects that aren't time-based
-    fe_vars_to_shift = [fe for fe in absorb if fe != time]
-    vars_to_shift.extend(fe_vars_to_shift)
-    
-    # Only proceed if there are variables to shift
-    if vars_to_shift:
-        # Merge with original data to get the control values at control time
-        control_cols = [unit, time] + vars_to_shift
-        # Filter to only include columns that exist in the data
-        control_cols = [col for col in control_cols if col in data.columns]
-        
-        control_data = data[control_cols].copy()
-        control_data = control_data.rename(columns={time: 'control_time'})
-        
-        # Merge to get values at control time
-        reg_data = reg_data.merge(
-            control_data,
-            on=[unit, 'control_time'],
-            how='left',
-            suffixes=('_current', '_control')
-        )
-        
-        # Replace current values with control period values
-        for var in vars_to_shift:
-            if f'{var}_control' in reg_data.columns:
-                reg_data[var] = reg_data[f'{var}_control']
-                reg_data = reg_data.drop(columns=[f'{var}_control'])
-            if f'{var}_current' in reg_data.columns:
-                reg_data = reg_data.drop(columns=[f'{var}_current'])
-    
-    # Clean up control_time column
-    reg_data = reg_data.drop(columns=['control_time'])
-    
-    return reg_data
-
-
 def _build_regression_formula_standalone(y_var, fe_vars, controls, interact_vars, data):
     """Standalone version of _build_regression_formula for Ray"""
     # Build control variables part
@@ -1209,12 +1075,57 @@ class LPDiD:
             pre_mask = horizon_indices < 0
             dy[pre_mask] = -dy[pre_mask]
         
-        # Step 9: Apply min_time_controls adjustment if needed
-        # Note: This is a simplified implementation - full min_time_controls logic
-        # would require more complex handling of control period selection
+        # Step 9: Calculate control/selection period indices
+        # For post-treatment (h >= 0): use t-1
+        # For pre-treatment (h < 0): use t-h  
+        control_indices = np.where(
+            horizon_indices >= 0,
+            t_minus_1_indices,  # For post-treatment: use t-1
+            long_indices + horizon_indices  # For pre-treatment: use t-h (which is long_indices + negative h)
+        )
         
-        # Step 10: Build result DataFrame (only valid observations)
+        # Step 10: Apply min_time_selection if specified
         keep_mask = ~np.isnan(dy)
+        
+        if self.min_time_selection and keep_mask.any():
+            # Extract values at selection time for condition evaluation
+            selection_mask = keep_mask.copy()
+            
+            # Get column names that might be used in the condition
+            # Parse the condition to find variable names
+            import ast
+            try:
+                # Create a temporary DataFrame for evaluation
+                # Only include rows where we have valid differences
+                temp_data = {}
+                temp_data[self.unit] = units[long_indices[selection_mask]]
+                temp_data[self.time] = self.data[self.time].values[long_indices[selection_mask]]
+                
+                # Extract all columns that might be in the condition at selection time
+                for col in self.data.columns:
+                    if col not in [self.unit, self.time, 'D_treat'] and col in self.data.columns:
+                        # Get values from the selection period
+                        temp_data[col] = self.data[col].values[control_indices[selection_mask]]
+                
+                # Create temporary DataFrame for evaluation
+                eval_df = pd.DataFrame(temp_data)
+                
+                # Evaluate the condition
+                condition_result = eval_df.eval(self.min_time_selection)
+                
+                # Update the keep_mask based on condition
+                # First, create a full-size mask initialized to False
+                full_condition_mask = np.zeros(len(keep_mask), dtype=bool)
+                # Then set True values where selection_mask is True
+                full_condition_mask[selection_mask] = condition_result.values
+                
+                # Final keep_mask combines valid differences and selection condition
+                keep_mask = keep_mask & full_condition_mask
+                
+            except Exception as e:
+                warnings.warn(f"Failed to apply min_time_selection condition '{self.min_time_selection}': {e}")
+        
+        # Step 11: Build result DataFrame (only valid observations)
         
         # Build dictionary column by column for efficiency
         result_dict = {
@@ -1226,7 +1137,7 @@ class LPDiD:
             'is_pre': (horizon_indices[keep_mask] < 0).astype(int)
         }
         
-        # Add remaining columns
+        # Add remaining columns with min_time_controls logic
         essential_cols = self.controls + self.absorb + self.cluster_vars
         if self.weights:
             essential_cols.append(self.weights)
@@ -1236,15 +1147,36 @@ class LPDiD:
         # Remove duplicates
         essential_cols = list(dict.fromkeys(essential_cols))
         
+        # Determine which columns should use control period values
+        control_period_cols = set()
+        if self.min_time_controls:
+            # Controls and non-time fixed effects should use control period values
+            control_period_cols.update(self.controls)
+            control_period_cols.update([fe for fe in self.absorb if fe != self.time])
+        
         for col in essential_cols:
             if col in self.data.columns:
-                result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+                if col in control_period_cols:
+                    # Use values from control period
+                    result_dict[col] = self.data[col].values[control_indices[keep_mask]]
+                else:
+                    # Use values from current period
+                    result_dict[col] = self.data[col].values[long_indices[keep_mask]]
         
         # Add interaction columns if present
         if self.interact_vars:
             interaction_cols = [c for c in self.data.columns if c.startswith('D_treat_')]
             for col in interaction_cols:
                 result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+            
+            # Also add the interaction variables themselves with control period logic if needed
+            for var in self.interact_vars:
+                clean_var = var.replace("i.", "") if var.startswith("i.") else var
+                if clean_var in self.data.columns and clean_var not in result_dict:
+                    if self.min_time_controls and clean_var in control_period_cols:
+                        result_dict[clean_var] = self.data[clean_var].values[control_indices[keep_mask]]
+                    else:
+                        result_dict[clean_var] = self.data[clean_var].values[long_indices[keep_mask]]
         
         # Create final DataFrame
         self.long_diff_data = pd.DataFrame(result_dict)
@@ -1460,15 +1392,6 @@ class LPDiD:
         if reg_data.shape[0] == 0:
             return None
         
-        # Apply min_time_selection filter if specified
-        reg_data = self._apply_min_time_selection(reg_data, horizon, is_pre)
-        
-        if reg_data.shape[0] == 0:
-            return None
-        
-        # Apply min_time_controls logic if specified
-        reg_data = self._apply_min_time_controls(reg_data, horizon, is_pre)
-        
         # Build formula using 'Dy' as the dependent variable
         # Ensure unique fixed effects (avoid duplicates)
         fe_vars = [self.time] + self.absorb
@@ -1512,7 +1435,7 @@ class LPDiD:
                     copy_data=self.copy_data
                 )
             
-            nobs = len(reg_data)
+            nobs = fit._N
             
             # Store results dictionary
             results = {
@@ -1702,11 +1625,14 @@ class LPDiD:
         Fit the Local Projections Difference-in-Differences (LP-DiD) model.
 
         This method executes the full LP-DiD estimation pipeline:
-        1. Identifies clean control units that are never treated.
-        2. Constructs long-differenced outcomes for each horizon.
-        3. Computes weights for the regression if specified.
+        1. Identifies clean control units that are never treated (if not already done).
+        2. Constructs long-differenced outcomes for each horizon (if not already done).
+        3. Computes weights for the regression if specified (if not already done).
         4. Runs separate regressions for each pre- and post-treatment horizon.
         5. Collates the results into an `LPDiDResults` object.
+        
+        If `build()` has been called previously, steps 1-3 are skipped and the method
+        proceeds directly to running regressions using the already prepared data.
 
         Returns
         -------
@@ -1717,21 +1643,25 @@ class LPDiD:
         print("Starting LP-DiD Estimation (Linear Model)")
         print("="*60)
         
-        # Step 1: Identify units that are never treated to serve as clean controls.
-        print("\nStep 1: Identifying clean control samples...")
-        self._identify_clean_controls()
-        print("Clean control identification complete.")
-        
-        # Step 2: Create the long-differenced outcome variable for each horizon.
-        print("\nStep 2: Generating long differences...")
-        self._generate_long_differences()
-        print("Long differences generation complete.")
-        
-        # Step 3: Compute regression weights if a weighting variable is specified.
-        if self.rw:
-            print("\nStep 3: Computing regression weights...")
-            self._compute_weights()
-            print("Weight computation complete.")
+        # Check if data has already been built
+        if hasattr(self, 'long_diff_data'):
+            print("\nUsing previously built data. Skipping data preparation steps.")
+        else:
+            # Step 1: Identify units that are never treated to serve as clean controls.
+            print("\nStep 1: Identifying clean control samples...")
+            self._identify_clean_controls()
+            print("Clean control identification complete.")
+            
+            # Step 2: Create the long-differenced outcome variable for each horizon.
+            print("\nStep 2: Generating long differences...")
+            self._generate_long_differences()
+            print("Long differences generation complete.")
+            
+            # Step 3: Compute regression weights if a weighting variable is specified.
+            if self.rw:
+                print("\nStep 3: Computing regression weights...")
+                self._compute_weights()
+                print("Weight computation complete.")
         
         # Step 4: Run event-study regressions for each specified horizon.
         print(f"\nStep 4: Running {(self.pre_window - 1) + (self.post_window + 1)} regressions...")
@@ -1776,16 +1706,11 @@ class LPDiD:
                         absorb=self.absorb,
                         cluster_vars=self.cluster_vars,
                         interact_vars=self.interact_vars,
-                        data=self.data,
                         wildbootstrap=self.wildbootstrap,
                         seed=self.seed,
                         weights=self.weights,
                         lean=self.lean,
-                        copy_data=self.copy_data,
-                        min_time_selection=self.min_time_selection,
-                        unit=self.unit,
-                        min_time_controls=self.min_time_controls,
-                        swap_pre_diff=self.swap_pre_diff
+                        copy_data=self.copy_data
                     )
                     ray_futures.append(future)
                 
@@ -1861,9 +1786,83 @@ class LPDiD:
         
         return results
     
+    def build(self):
+        """
+        Build the data for LP-DiD estimation without running regressions.
+        
+        This method executes the data preparation steps of the LP-DiD pipeline:
+        1. Identifies clean control units that are never treated.
+        2. Constructs long-differenced outcomes for each horizon.
+        3. Computes weights for the regression if specified.
+        
+        Unlike `fit()`, this method does not run any regressions. It is useful when you want to:
+        - Inspect the generated long-difference data before estimation
+        - Use the prepared data for custom analyses
+        - Save computation time when iterating on data preparation options
+        
+        Returns
+        -------
+        self
+            Returns the LPDiD instance for method chaining.
+            
+        Notes
+        -----
+        After calling `build()`, you can access the prepared data using:
+        - `get_long_diff_data()`: Returns the long-format difference data
+        - Direct access to `self.long_diff_data` attribute
+        
+        Examples
+        --------
+        >>> # Build data without running regressions
+        >>> lpdid = LPDiD(data, depvar='y', unit='id', time='t', treat='treat')
+        >>> lpdid.build()
+        >>> 
+        >>> # Access the prepared data
+        >>> long_data = lpdid.get_long_diff_data()
+        >>> print(f"Generated {len(long_data)} observations across {long_data['h'].nunique()} horizons")
+        >>> 
+        >>> # Later run regressions if desired
+        >>> results = lpdid.fit()
+        """
+        print("\n" + "="*60)
+        print("Building LP-DiD Data (without running regressions)")
+        print("="*60)
+        
+        # Step 1: Identify units that are never treated to serve as clean controls.
+        print("\nStep 1: Identifying clean control samples...")
+        self._identify_clean_controls()
+        print("Clean control identification complete.")
+        
+        # Step 2: Create the long-differenced outcome variable for each horizon.
+        print("\nStep 2: Generating long differences...")
+        self._generate_long_differences()
+        print("Long differences generation complete.")
+        
+        # Step 3: Compute regression weights if a weighting variable is specified.
+        if self.rw:
+            print("\nStep 3: Computing regression weights...")
+            self._compute_weights()
+            print("Weight computation complete.")
+        
+        # Print summary
+        print("\n" + "-"*40)
+        print("Data Build Summary")
+        print("-"*40)
+        if hasattr(self, 'long_diff_data'):
+            print(f"Total observations: {len(self.long_diff_data):,}")
+            print(f"Unique units: {self.long_diff_data[self.unit].nunique():,}")
+            print(f"Unique time periods: {self.long_diff_data[self.time].nunique():,}")
+            print(f"Horizons included: {sorted(self.long_diff_data['h'].unique())}")
+            print(f"Treatment changes: {self.long_diff_data['D_treat'].sum():,}")
+        
+        print("\nData preparation complete. Use get_long_diff_data() to access the prepared data.")
+        print("="*60 + "\n")
+        
+        return self
+    
     def get_long_diff_data(self):
         """
-        Get the long-format difference data generated during the fit process.
+        Get the long-format difference data generated during the fit or build process.
         
         This method returns the internally generated long-format dataset that contains
         all the long differences stacked vertically. Each row represents a unit-time-horizon
@@ -1878,7 +1877,7 @@ class LPDiD:
         Returns
         -------
         pd.DataFrame or None
-            The long-format difference data if available, None if fit() hasn't been called yet.
+            The long-format difference data if available, None if fit() or build() hasn't been called yet.
             
         Notes
         -----
@@ -1897,6 +1896,11 @@ class LPDiD:
         >>> # Get the long format data
         >>> long_data = lpdid.get_long_diff_data()
         >>> 
+        >>> # Or just build the data without fitting
+        >>> lpdid2 = LPDiD(data, depvar='y', unit='id', time='t', treat='treat')
+        >>> lpdid2.build()
+        >>> long_data2 = lpdid2.get_long_diff_data()
+        >>> 
         >>> # Example: Run a pooled regression
         >>> import statsmodels.formula.api as smf
         >>> pooled_model = smf.ols('Dy ~ D_treat + C(h)', data=long_data[long_data['CCS']==1]).fit()
@@ -1904,7 +1908,7 @@ class LPDiD:
         if hasattr(self, 'long_diff_data'):
             return self.long_diff_data.copy()
         else:
-            warnings.warn("Long difference data not available. Please run fit() first.")
+            warnings.warn("Long difference data not available. Please run fit() or build() first.")
             return None
 
 
@@ -1971,11 +1975,14 @@ class LPDiDPois(LPDiD):
         Fit the Local Projections Difference-in-Differences (LP-DiD) model using Poisson regression.
 
         This method executes the full LP-DiD estimation pipeline:
-        1. Identifies clean control units that are never treated.
-        2. Constructs long-differenced outcomes for each horizon.
-        3. Computes weights for the regression if specified.
+        1. Identifies clean control units that are never treated (if not already done).
+        2. Constructs long-differenced outcomes for each horizon (if not already done).
+        3. Computes weights for the regression if specified (if not already done).
         4. Runs separate Poisson regressions for each pre- and post-treatment horizon.
         5. Collates the results into an `LPDiDResults` object.
+        
+        If `build()` has been called previously, steps 1-3 are skipped and the method
+        proceeds directly to running regressions using the already prepared data.
 
         Returns
         -------
@@ -1986,21 +1993,25 @@ class LPDiDPois(LPDiD):
         print("Starting LP-DiD Estimation (Poisson Model)")
         print("="*60)
         
-        # Step 1: Identify units that are never treated to serve as clean controls.
-        print("\nStep 1: Identifying clean control samples...")
-        self._identify_clean_controls()
-        print("Clean control identification complete.")
-        
-        # Step 2: Create the long-differenced outcome variable for each horizon.
-        print("\nStep 2: Generating long differences...")
-        self._generate_long_differences()
-        print("Long differences generation complete.")
-        
-        # Step 3: Compute regression weights if a weighting variable is specified.
-        if self.rw:
-            print("\nStep 3: Computing regression weights...")
-            self._compute_weights()
-            print("Weight computation complete.")
+        # Check if data has already been built
+        if hasattr(self, 'long_diff_data'):
+            print("\nUsing previously built data. Skipping data preparation steps.")
+        else:
+            # Step 1: Identify units that are never treated to serve as clean controls.
+            print("\nStep 1: Identifying clean control samples...")
+            self._identify_clean_controls()
+            print("Clean control identification complete.")
+            
+            # Step 2: Create the long-differenced outcome variable for each horizon.
+            print("\nStep 2: Generating long differences...")
+            self._generate_long_differences()
+            print("Long differences generation complete.")
+            
+            # Step 3: Compute regression weights if a weighting variable is specified.
+            if self.rw:
+                print("\nStep 3: Computing regression weights...")
+                self._compute_weights()
+                print("Weight computation complete.")
         
         # Step 4: Run event-study regressions for each specified horizon.
         print(f"\nStep 4: Running {(self.pre_window - 1) + (self.post_window + 1)} regressions...")
@@ -2045,16 +2056,11 @@ class LPDiDPois(LPDiD):
                         absorb=self.absorb,
                         cluster_vars=self.cluster_vars,
                         interact_vars=self.interact_vars,
-                        data=self.data,
                         wildbootstrap=self.wildbootstrap,
                         seed=self.seed,
                         weights=self.weights,
                         lean=self.lean,
-                        copy_data=self.copy_data,
-                        min_time_selection=self.min_time_selection,
-                        unit=self.unit,
-                        min_time_controls=self.min_time_controls,
-                        swap_pre_diff=self.swap_pre_diff
+                        copy_data=self.copy_data
                     )
                     ray_futures.append(future)
                 
@@ -2141,12 +2147,6 @@ class LPDiDPois(LPDiD):
         if reg_data.shape[0] == 0:
             return None
         
-        # Apply min_time_selection filter if specified
-        reg_data = self._apply_min_time_selection(reg_data, horizon, is_pre)
-        
-        if reg_data.shape[0] == 0:
-            return None
-        
         # For Poisson regression, we need non-negative outcomes
         # Check if we have negative values and warn
         if reg_data['Dy'].min() < 0:
@@ -2155,9 +2155,6 @@ class LPDiDPois(LPDiD):
                          "or use regular LPDiD for continuous outcomes.")
             # Convert negative values to 0 for Poisson
             reg_data['Dy'] = np.maximum(reg_data['Dy'], 0)
-        
-        # Apply min_time_controls logic if specified
-        reg_data = self._apply_min_time_controls(reg_data, horizon, is_pre)
         
         # Build formula using 'Dy' as the dependent variable
         # Ensure unique fixed effects (avoid duplicates)
@@ -2202,7 +2199,7 @@ class LPDiDPois(LPDiD):
                     copy_data=self.copy_data
                 )
             
-            nobs = len(reg_data)
+            nobs = fit._N
             
             # Store results dictionary
             results = {

@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="LPDiD",
-    version="0.1.0",
+    version="0.5.0",
     author="Peter John Lambert",
     author_email="p.j.lambert@lse.ac.uk",
     description="Local Projections Difference-in-Differences (LP-DiD) for Python",
