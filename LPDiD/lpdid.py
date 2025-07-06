@@ -1088,6 +1088,9 @@ class LPDiD:
         keep_mask = ~np.isnan(dy)
         
         if self.min_time_selection and keep_mask.any():
+            # Count observations before min_time_selection
+            obs_before_selection = keep_mask.sum()
+            
             # Extract values at selection time for condition evaluation
             selection_mask = keep_mask.copy()
             
@@ -1121,6 +1124,13 @@ class LPDiD:
                 
                 # Final keep_mask combines valid differences and selection condition
                 keep_mask = keep_mask & full_condition_mask
+                
+                # Count and print how many observations were dropped
+                obs_after_selection = keep_mask.sum()
+                obs_dropped = obs_before_selection - obs_after_selection
+                print(f"Min-time selection applied: {obs_dropped:,} observations dropped ({100*obs_dropped/obs_before_selection:.1f}%)")
+                print(f"  Before: {obs_before_selection:,} observations")
+                print(f"  After: {obs_after_selection:,} observations")
                 
             except Exception as e:
                 warnings.warn(f"Failed to apply min_time_selection condition '{self.min_time_selection}': {e}")
@@ -1181,16 +1191,53 @@ class LPDiD:
         # Create final DataFrame
         self.long_diff_data = pd.DataFrame(result_dict)
         
-        # Apply CCS filtering
+        # Apply CCS filtering according to Dube et al. (2023)
+        # Clean Control Sample includes:
+        # 1. Newly treated (D_treat = 1)
+        # 2. Clean controls (units that remain untreated through t+h)
+        
+        # First, we need to get treatment status at t+h for each observation
+        # We'll merge with original data to get D_{i,t+h}
+        
+        # Create a temporary column for t+h
+        self.long_diff_data['t_plus_h'] = self.long_diff_data[self.time] + self.long_diff_data['h']
+        
+        # Get treatment status at t+h
+        treatment_at_t_plus_h = self.data[[self.unit, self.time, self.treat]].copy()
+        treatment_at_t_plus_h = treatment_at_t_plus_h.rename(columns={
+            self.time: 't_plus_h',
+            self.treat: 'D_at_t_plus_h'
+        })
+        
+        # Merge to get D_{i,t+h}
+        self.long_diff_data = self.long_diff_data.merge(
+            treatment_at_t_plus_h,
+            on=[self.unit, 't_plus_h'],
+            how='left'
+        )
+        
+        # For observations where t+h is beyond the data, assume untreated
+        self.long_diff_data['D_at_t_plus_h'] = self.long_diff_data['D_at_t_plus_h'].fillna(0)
+        
+        # Apply CCS condition: either newly treated OR clean control
+        # Newly treated: D_treat = 1
+        # Clean control: D_treat = 0 AND D_at_t_plus_h = 0
+        self.long_diff_data['CCS'] = (
+            (self.long_diff_data['D_treat'] == 1) |  # Newly treated
+            ((self.long_diff_data['D_treat'] == 0) & (self.long_diff_data['D_at_t_plus_h'] == 0))  # Clean control
+        ).astype(int)
+        
+        # If nevertreated option is specified, further restrict to never-treated controls
         if self.nevertreated and 'never_treated' in self.long_diff_data.columns:
-            # Mark observations from always-treated units as not clean controls
-            self.long_diff_data['CCS'] = ~(
-                (self.long_diff_data['D_treat'] == 0) & 
-                (self.long_diff_data['never_treated'] == 0)
-            ).astype(int)
-        else:
-            # Standard case: all observations are clean controls
-            self.long_diff_data['CCS'] = 1
+            # For controls, also require never_treated = 1
+            self.long_diff_data.loc[
+                self.long_diff_data['D_treat'] == 0, 'CCS'
+            ] = self.long_diff_data.loc[
+                self.long_diff_data['D_treat'] == 0
+            ].apply(
+                lambda x: int(x['CCS'] == 1 and x['never_treated'] == 1), 
+                axis=1
+            )
         
         # Apply CCS filtering to keep only clean control samples
         print(f"Applying CCS filtering...")
@@ -1200,8 +1247,9 @@ class LPDiD:
         print(f"CCS filtering complete. Kept {post_filter_count:,} of {pre_filter_count:,} observations " 
               f"({100*post_filter_count/pre_filter_count:.1f}%)")
         
-        # Drop the CCS column as it's no longer needed after filtering
-        self.long_diff_data = self.long_diff_data.drop(columns=['CCS'])
+        # Drop temporary columns used for CCS filtering
+        columns_to_drop = ['CCS', 't_plus_h', 'D_at_t_plus_h']
+        self.long_diff_data = self.long_diff_data.drop(columns=[col for col in columns_to_drop if col in self.long_diff_data.columns])
     
 
     def _compute_weights(self):
