@@ -146,7 +146,7 @@ def _run_single_regression_ray(
             
             for var in interact_vars:
                 clean_var = var.replace("i.", "") if var.startswith("i.") else var
-                unique_vals = sorted(data[clean_var].dropna().unique())
+                unique_vals = sorted(long_diff_data[clean_var].dropna().unique())
                 
                 for val in unique_vals:
                     group_name = f"{clean_var}_{val}"
@@ -398,7 +398,7 @@ def _run_single_regression_ray_poisson(
             
             for var in interact_vars:
                 clean_var = var.replace("i.", "") if var.startswith("i.") else var
-                unique_vals = sorted(data[clean_var].dropna().unique())
+                unique_vals = sorted(long_diff_data[clean_var].dropna().unique())
                 
                 for val in unique_vals:
                     group_name = f"{clean_var}_{val}"
