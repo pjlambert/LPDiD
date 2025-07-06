@@ -1020,7 +1020,93 @@ class LPDiD:
         print("Using optimized vectorized approach with integrated CCS filtering")
         
         # Always use vectorized approach
-        self._generate_differences_vectorized()
+        self._generate_differences_vectorized_corrected()
+    
+    def _generate_differences_vectorized_corrected(self):
+        """Corrected vectorized long difference generation to match pyfixest exactly"""
+        print("Using corrected NumPy vectorized approach for long differences...")
+        
+        # Store results for each horizon
+        all_results = []
+        
+        # Process POST-treatment horizons (0 to post_window)
+        for h in range(self.post_window + 1):
+            # Create long difference: y_{t+h} - y_{t-1}
+            # Using shift(-h) for forward shift
+            self.data[f'Dy_h{h}'] = (
+                self.data.groupby(self.unit)[self.depvar].shift(-h) - 
+                self.data.groupby(self.unit)[self.depvar].shift(1)
+            )
+            
+            # Sample restriction for post-treatment
+            # Include: newly treated (D_treat == 1) OR clean controls (treat at t+h == 0)
+            clean_control_mask = self.data.groupby(self.unit)[self.treat].shift(-h) == 0
+            sample_mask = (self.data['D_treat'] == 1) | clean_control_mask
+            
+            # Apply never-treated restriction if specified
+            if self.nevertreated and 'never_treated' in self.data.columns:
+                # For controls, also require never_treated = 1
+                sample_mask = sample_mask & (
+                    (self.data['D_treat'] == 1) | 
+                    ((self.data['D_treat'] == 0) & (self.data['never_treated'] == 1))
+                )
+            
+            # Create horizon data
+            horizon_data = self.data[sample_mask].copy()
+            horizon_data['Dy'] = horizon_data[f'Dy_h{h}']
+            horizon_data['h'] = h
+            horizon_data['is_pre'] = 0
+            
+            # Drop the temporary column
+            self.data = self.data.drop(columns=[f'Dy_h{h}'])
+            
+            all_results.append(horizon_data)
+        
+        # Process PRE-treatment horizons (2 to pre_window)
+        for h in range(2, self.pre_window + 1):
+            # Create long difference: y_{t-h} - y_{t-1}
+            # Using shift(h) for backward shift
+            self.data[f'Dy_h{-h}'] = (
+                self.data.groupby(self.unit)[self.depvar].shift(h) - 
+                self.data.groupby(self.unit)[self.depvar].shift(1)
+            )
+            
+            # Sample restriction for pre-treatment
+            # Include: newly treated (D_treat == 1) OR clean controls (treat == 0)
+            sample_mask = (self.data['D_treat'] == 1) | (self.data[self.treat] == 0)
+            
+            # Apply never-treated restriction if specified
+            if self.nevertreated and 'never_treated' in self.data.columns:
+                sample_mask = sample_mask & (
+                    (self.data['D_treat'] == 1) | 
+                    ((self.data['D_treat'] == 0) & (self.data['never_treated'] == 1))
+                )
+            
+            # Create horizon data
+            horizon_data = self.data[sample_mask].copy()
+            horizon_data['Dy'] = horizon_data[f'Dy_h{-h}']
+            horizon_data['h'] = -h  # Negative for pre-treatment
+            horizon_data['is_pre'] = 1
+            
+            # Drop the temporary column
+            self.data = self.data.drop(columns=[f'Dy_h{-h}'])
+            
+            all_results.append(horizon_data)
+        
+        # Combine all horizons
+        self.long_diff_data = pd.concat(all_results, ignore_index=True)
+        
+        # Remove any rows with missing Dy values
+        initial_count = len(self.long_diff_data)
+        self.long_diff_data = self.long_diff_data.dropna(subset=['Dy'])
+        dropped_count = initial_count - len(self.long_diff_data)
+        if dropped_count > 0:
+            print(f"Dropped {dropped_count:,} observations with missing Dy values")
+        
+        # Sort by unit, time, and horizon for consistency
+        self.long_diff_data = self.long_diff_data.sort_values([self.unit, self.time, 'h'])
+        
+        print(f"Long differences generation complete. Created {len(self.long_diff_data):,} observations")
     
     def _generate_differences_vectorized(self):
         """Ultra-fast vectorized long difference generation using NumPy"""
@@ -1153,6 +1239,16 @@ class LPDiD:
             essential_cols.append(self.weights)
         if 'never_treated' in self.data.columns:
             essential_cols.append('never_treated')
+        
+        # Parse interaction fixed effects and add constituent variables
+        for fe in self.absorb:
+            if '^' in fe:
+                # Split by ^ to get individual components
+                components = fe.split('^')
+                for component in components:
+                    component = component.strip()
+                    if component and component not in essential_cols:
+                        essential_cols.append(component)
         
         # Remove duplicates
         essential_cols = list(dict.fromkeys(essential_cols))
