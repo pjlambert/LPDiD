@@ -9,15 +9,15 @@ A Python implementation of the Local Projections Difference-in-Differences (LP-D
 - **Binary treatment support**: Both absorbing and non-absorbing treatments
 - **Treatment effect heterogeneity**: Interaction terms to explore effect variation  
 - **Formula interface**: R-style formulas for controls and fixed effects
-- **Wild bootstrap inference**: Cluster-robust wild bootstrap standard errors
-- **Multi-way clustering**: Support for multiple clustering variables
+- **Wild bootstrap inference**: Cluster-robust wild bootstrap for p-values and t-statistics
+- **Multi-way clustering**: Support for multiple clustering variables (2+ clusters)
 - **Flexible estimation**: Event study and pooled treatment effects
-- **Enhanced parallel processing**: Parallelized data reshaping and regression estimation for 2-8x speedups
-- **Multiple control groups**: Never-treated, not-yet-treated, or clean controls
-- **Reweighting options**: Variance-weighted or equally-weighted ATEs
-- **Pre-mean differencing**: Alternative baseline specifications
-- **Sample Weights**: Permits sample weights to allow for matching/PSM/CEM
+- **Ray-based parallel processing**: Distributed computing with Ray for 2-8x speedups
+- **Multiple control groups**: Never-treated or clean controls
+- **Sample weights**: Permits sample weights to allow for matching/PSM/CEM
 - **Poisson estimation**: LPDiDPois for count data and log-linear models
+- **Data building**: Separate data preparation from estimation for flexibility
+- **Long-format export**: Access to prepared long-difference data for custom analyses
 
 ## Installation
 
@@ -35,8 +35,8 @@ pip install -e .
 - pyfixest >= 0.18.0
 - matplotlib >= 3.3.0
 - scipy >= 1.5.0
-- joblib >= 1.0.0
-- wildboottest >= 0.1.0 (optional, for wild bootstrap)
+- ray >= 2.0.0
+- tqdm >= 4.60.0
 
 ## Quick Start
 
@@ -54,7 +54,7 @@ lpdid = LPDiD(
     pre_window=5,              # Pre-treatment periods
     post_window=10,            # Post-treatment periods
     formula="~ x1 + x2 | fe1 + fe2",  # Controls and fixed effects
-    n_jobs=-1                  # Use all CPU cores
+    n_jobs=-1                  # Use all CPU cores with Ray
 )
 
 # Fit the model
@@ -62,7 +62,6 @@ results = lpdid.fit()
 
 # View results
 print(results.event_study)
-print(results.pooled)
 
 # Summary report
 results.summary()
@@ -107,7 +106,7 @@ results = lpdid_het.fit()
 
 # Extract interaction effects
 event_study = results.event_study
-print(event_study[['horizon', 'coefficient', 'size_interaction', 'size_interaction_se']])
+print(event_study[['horizon', 'coefficient', 'size_coef', 'size_se']])
 ```
 
 ### Formula Interface
@@ -126,6 +125,8 @@ formula="~ x1 + i.category | FE"  # i.category creates dummies
 ```
 
 ### Wild Bootstrap Inference
+
+**Note:** Wild bootstrap adjusts p-values and t-statistics only. Standard errors and confidence intervals remain analytical.
 
 ```python
 # Wild bootstrap with single clustering
@@ -158,7 +159,20 @@ lpdid = LPDiD(
     post_window=10,
     formula="~ x1 + x2 | fe1",
     cluster_formula="~ cluster1 + cluster2",  # Multiple clusters
-    wildbootstrap=999,  # Uses first cluster for wild bootstrap
+    n_jobs=-1
+)
+
+# Three or more clustering variables
+lpdid_3way = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | fe1",
+    cluster_formula="~ state + industry + year",  # 3-way clustering
     n_jobs=-1
 )
 ```
@@ -177,21 +191,6 @@ lpdid = LPDiD(
     post_window=10,
     formula="~ x1 + x2 | industry",
     weights='population_weight',  # Weight variable
-    n_jobs=-1
-)
-
-# Combine with reweighting for equally-weighted ATE
-lpdid = LPDiD(
-    data=data,
-    depvar='y',
-    unit='unit',
-    time='time',
-    treat='treat',
-    pre_window=5,
-    post_window=10,
-    formula="~ x1 + x2 | industry",
-    weights='population_weight',
-    rw=True,                     # Also reweight for equal weights
     n_jobs=-1
 )
 ```
@@ -234,25 +233,6 @@ lpdid_never = LPDiD(
 )
 ```
 
-### Pre-mean Differencing
-
-```python
-# Use average of all pre-treatment periods as baseline
-lpdid_pmd = LPDiD(
-    data=data,
-    depvar='y',
-    unit='unit',
-    time='time',
-    treat='treat',
-    pre_window=5,
-    post_window=10,
-    formula="~ x1 + x2 | industry",
-    pmd='max',              # Use all available pre-periods
-    wildbootstrap=999,
-    n_jobs=-1
-)
-```
-
 ### Control Period Selection
 
 The package provides advanced options for selecting control periods in long differences:
@@ -268,7 +248,7 @@ lpdid_min_controls = LPDiD(
     pre_window=5,
     post_window=10,
     formula="~ x1 + x2 | industry",
-    min_time_controls=True,  # Use min(t-1, t+h) for control periods
+    min_time_controls=True,  # Use earlier period for controls
     n_jobs=-1
 )
 
@@ -296,7 +276,7 @@ lpdid_swap = LPDiD(
     pre_window=5,
     post_window=10,
     formula="~ x1 + x2 | industry",
-    swap_pre_diff=True,  # Use y_t-1 - y_t+h instead of y_t+h - y_t-1 for pre-treatment
+    swap_pre_diff=True,  # Use y_{t-1} - y_{t-h} for pre-treatment
     n_jobs=-1
 )
 
@@ -318,10 +298,43 @@ lpdid_combined = LPDiD(
 ```
 
 **Control Period Logic:**
-- `min_time_controls=True`: For pre-treatment periods, uses `min(t-1, t+h)` as control
+- `min_time_controls=True`: Uses the earlier period of the long-difference for control variables
+  - For post-treatment (t-1 to t+h): controls from t-1
+  - For pre-treatment (t-h to t-1): controls from t-h
 - `min_time_selection`: Filters units based on boolean condition at the control period
-- `swap_pre_diff=True`: For pre-treatment periods, computes `y_t-1 - y_t+h` instead of `y_t+h - y_t-1`
-- Supports conditions like `'alive==1'`, `'status>0'`, `'employed==True'`
+- `swap_pre_diff=True`: For pre-treatment periods, computes `y_{t-1} - y_{t-h}` instead of `y_{t-h} - y_{t-1}`
+
+### Data Building and Custom Analysis
+
+Build data without running regressions:
+
+```python
+# Build long-format data
+lpdid = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry"
+)
+
+# Build data only
+lpdid.build()
+
+# Access the long-format data
+long_data = lpdid.get_long_diff_data()
+print(f"Generated {len(long_data)} observations")
+
+# Use for custom analysis
+import statsmodels.formula.api as smf
+pooled = smf.ols('Dy ~ D_treat + C(h)', data=long_data).fit()
+
+# Later run regressions if desired
+results = lpdid.fit()  # Uses already built data
+```
 
 ### Poisson Estimation (LPDiDPois)
 
@@ -347,6 +360,25 @@ results_pois = lpdid_pois.fit()
 results_pois.summary()
 ```
 
+### Memory Optimization
+
+```python
+# For large datasets, use memory-efficient options
+lpdid = LPDiD(
+    data=data,
+    depvar='y',
+    unit='unit',
+    time='time',
+    treat='treat',
+    pre_window=5,
+    post_window=10,
+    formula="~ x1 + x2 | industry",
+    lean=True,       # Memory-efficient regression objects (default)
+    copy_data=False, # Don't copy data in pyfixest (default)
+    n_jobs=-1
+)
+```
+
 ## Main Parameters
 
 - `data`: Panel DataFrame
@@ -363,15 +395,15 @@ results_pois.summary()
 - `dylags`: Number of first-differenced outcome lags
 - `nonabsorbing`: Tuple (L, notyet, firsttreat) for non-absorbing treatment
 - `nevertreated`: Use only never-treated as controls
-- `nocomp`: Avoid composition changes
-- `rw`: Reweight for equally-weighted ATE
-- `pmd`: Pre-mean differencing specification
-- `min_time_controls`: Use min(t-1, t+h) for control periods (default: False)
+- `min_time_controls`: Use earlier period for control variables (default: False)
 - `min_time_selection`: Boolean condition for unit inclusion at control periods
 - `swap_pre_diff`: Swap pre-treatment difference direction (default: False)
 - `wildbootstrap`: Number of wild bootstrap iterations
 - `weights`: Weight variable
-- `n_jobs`: Number of parallel jobs
+- `n_jobs`: Number of parallel jobs (-1 for all cores)
+- `lean`: Memory-efficient regression objects (default: True)
+- `copy_data`: Copy data in pyfixest (default: False)
+- `seed`: Random seed for reproducibility
 
 ## Output
 
@@ -379,27 +411,44 @@ The `fit()` method returns a `LPDiDResults` object containing:
 
 - `event_study`: DataFrame with period-by-period treatment effects
   - Includes main effects and interaction terms if specified
-- `pooled`: DataFrame with averaged pre/post effects
 - `summary()`: Method to print comprehensive results
 
 Each results DataFrame includes:
+- `horizon`: Event time
 - `coefficient`: Point estimate
 - `se`: Standard error
 - `t`: t-statistic
-- `p`: p-value
+- `p`: p-value (adjusted by wild bootstrap if used)
 - `ci_low`, `ci_high`: Confidence interval
 - `obs`: Number of observations
-- Interaction coefficients and their SEs (if interactions specified)
+
+For models with interactions, additional columns:
+- `{var}_{value}_coef`: Group-specific coefficients
+- `{var}_{value}_se`: Group-specific standard errors
+- `{var}_{value}_p`: Group-specific p-values
 
 ## Interpreting Results
 
 ### Basic Model
 - `coefficient`: Average treatment effect on the treated (ATT)
+- Pre-treatment coefficients test parallel trends assumption
+- Horizon -1 is normalized to zero
 
 ### With Interactions
-- `coefficient`: Base effect (when interaction variables = 0)
-- `var_interaction`: How effect changes with the variable
-- Total effect = `coefficient + Σ(interaction_coef × var_value)`
+- Group-specific effects are reported as `{variable}_{value}_coef`
+- Total effect for a group = that group's specific coefficient
+
+## Performance Tips
+
+1. **Ray Parallelization**: The package uses Ray for distributed computing
+   - Automatically initialized when `n_jobs > 1`
+   - Handles memory more efficiently than traditional multiprocessing
+   
+2. **Vectorized Operations**: Long differences are computed using optimized NumPy operations
+   - Significantly faster for large datasets
+   - Memory-efficient implementation
+
+3. **Data Building**: Use `build()` to prepare data once, then run multiple analyses
 
 ## Citation
 
