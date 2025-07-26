@@ -949,12 +949,6 @@ class LPDiD:
         print(f"  Cores to be used: {actual_cores}")
         print(f"  Total regressions to run: {total_regressions}")
         
-        # Show multiprocessing configuration
-        current_mp_method = multiprocessing.get_start_method()
-        print(f"  Multiprocessing start method: {current_mp_method}")
-        if self.mp_type and self.mp_type != current_mp_method:
-            print(f"  Requested mp_type: {self.mp_type} (differs from current method)")
-        
         # Additional options
         if self.controls:
             print(f"\nControl variables: {', '.join(self.controls)}")
@@ -1924,12 +1918,6 @@ class LPDiDPois(LPDiD):
         print(f"  Available CPU cores: {multiprocessing.cpu_count()}")
         print(f"  Cores to be used: {actual_cores}")
         print(f"  Total regressions to run: {total_regressions}")
-        
-        # Show multiprocessing configuration
-        current_mp_method = multiprocessing.get_start_method()
-        print(f"  Multiprocessing start method: {current_mp_method}")
-        if self.mp_type and self.mp_type != current_mp_method:
-            print(f"  Requested mp_type: {self.mp_type} (differs from current method)")
         
         # Additional options
         if self.controls:
