@@ -1034,14 +1034,14 @@ class LPDiD:
         total_horizons = (self.post_window + 1) + (self.pre_window - 1)
         
         print(f"Generating long differences for {total_horizons} horizons...")
-        print("Using optimized vectorized approach with integrated CCS filtering")
+        print("Using vectorized approach with integrated CCS filtering")
         
         # Always use vectorized approach
         self._generate_differences_vectorized_corrected()
     
     def _generate_differences_vectorized_corrected(self):
         """Corrected vectorized long difference generation to match pyfixest exactly"""
-        print("Using corrected NumPy vectorized approach for long differences...")
+        print("Using faster NumPy vectorized approach for long differences...")
         
         # Store results for each horizon
         all_results = []
