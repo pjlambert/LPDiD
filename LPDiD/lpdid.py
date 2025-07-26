@@ -30,6 +30,8 @@ import warnings
 # Suppress various warnings that can occur during parallel processing
 warnings.filterwarnings("ignore", message=".*omp_set_nested.*")
 warnings.filterwarnings("ignore", message=".*OMP.*")
+warnings.filterwarnings("ignore", message=".*OMP_NESTED variable deprecated.*")
+warnings.filterwarnings("ignore", message=".*OMP_NESTED.*deprecated.*")
 warnings.filterwarnings("ignore", message=".*A worker stopped while some jobs were given to the executor.*")
 # Suppress Polars fork warnings
 warnings.filterwarnings("ignore", message=".*fork.*")
@@ -83,6 +85,10 @@ def _run_single_regression_ray(
     multiple Ray workers. It contains all the logic from the original
     _run_single_regression method but as a standalone function.
     """
+    # Suppress OMP warnings in Ray workers
+    os.environ['OMP_NESTED'] = 'FALSE'
+    os.environ['OMP_MAX_ACTIVE_LEVELS'] = '1'
+    
     # Determine horizon value for filtering
     horizon_value = -horizon if is_pre else horizon
     
@@ -326,6 +332,10 @@ def _run_single_regression_ray_poisson(
     multiple Ray workers. It contains all the logic from the original
     _run_single_regression method for Poisson regression.
     """
+    # Suppress OMP warnings in Ray workers
+    os.environ['OMP_NESTED'] = 'FALSE'
+    os.environ['OMP_MAX_ACTIVE_LEVELS'] = '1'
+    
     # Determine horizon value for filtering
     horizon_value = -horizon if is_pre else horizon
     
@@ -1645,19 +1655,14 @@ class LPDiD:
             
             # Initialize Ray if not already initialized
             if not ray.is_initialized():
-                # Configure Ray for memory-only operation with 800GB object store
                 ray.init(
                     num_cpus=n_cores,
                     ignore_reinit_error=True,
-                    object_store_memory=800 * 1024 * 1024 * 1024,  # 800GB in bytes
                     _system_config={
-                        "object_spilling_config": json.dumps({
-                            "type": "disabled"  # Disable spilling completely
-                        }),
-                        "max_io_workers": 0  # No IO workers needed since no spilling
+                        "automatic_object_spilling_enabled": False  # Disable disk spilling
                     }
                 )
-                print(f"Ray initialized with 800GB object store memory (no disk spilling).")
+                print("Ray initialized with spilling disabled.")
             
             try:
                 # Put the long_diff_data in Ray's object store for shared memory access
@@ -2009,19 +2014,14 @@ class LPDiDPois(LPDiD):
             
             # Initialize Ray if not already initialized
             if not ray.is_initialized():
-                # Configure Ray for memory-only operation with 800GB object store
                 ray.init(
                     num_cpus=n_cores,
                     ignore_reinit_error=True,
-                    object_store_memory=800 * 1024 * 1024 * 1024,  # 800GB in bytes
                     _system_config={
-                        "object_spilling_config": json.dumps({
-                            "type": "disabled"  # Disable spilling completely
-                        }),
-                        "max_io_workers": 0  # No IO workers needed since no spilling
+                        "automatic_object_spilling_enabled": False  # Disable disk spilling
                     }
                 )
-                print(f"Ray initialized with 800GB object store memory (no disk spilling).")
+                print("Ray initialized with spilling disabled.")
             
             try:
                 # Put the long_diff_data in Ray's object store for shared memory access
