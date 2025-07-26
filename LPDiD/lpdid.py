@@ -58,6 +58,7 @@ from dataclasses import dataclass
 from scipy import stats
 import re
 from tqdm import tqdm
+import json
 
 # Import wildboottest package
 try:
@@ -1644,8 +1645,19 @@ class LPDiD:
             
             # Initialize Ray if not already initialized
             if not ray.is_initialized():
-                ray.init(num_cpus=n_cores, ignore_reinit_error=True)
-                print("Ray initialized.")
+                # Configure Ray for memory-only operation with 800GB object store
+                ray.init(
+                    num_cpus=n_cores,
+                    ignore_reinit_error=True,
+                    object_store_memory=800 * 1024 * 1024 * 1024,  # 800GB in bytes
+                    _system_config={
+                        "object_spilling_config": json.dumps({
+                            "type": "disabled"  # Disable spilling completely
+                        }),
+                        "max_io_workers": 0  # No IO workers needed since no spilling
+                    }
+                )
+                print(f"Ray initialized with 800GB object store memory (no disk spilling).")
             
             try:
                 # Put the long_diff_data in Ray's object store for shared memory access
@@ -1997,8 +2009,19 @@ class LPDiDPois(LPDiD):
             
             # Initialize Ray if not already initialized
             if not ray.is_initialized():
-                ray.init(num_cpus=n_cores, ignore_reinit_error=True)
-                print("Ray initialized.")
+                # Configure Ray for memory-only operation with 800GB object store
+                ray.init(
+                    num_cpus=n_cores,
+                    ignore_reinit_error=True,
+                    object_store_memory=800 * 1024 * 1024 * 1024,  # 800GB in bytes
+                    _system_config={
+                        "object_spilling_config": json.dumps({
+                            "type": "disabled"  # Disable spilling completely
+                        }),
+                        "max_io_workers": 0  # No IO workers needed since no spilling
+                    }
+                )
+                print(f"Ray initialized with 800GB object store memory (no disk spilling).")
             
             try:
                 # Put the long_diff_data in Ray's object store for shared memory access
