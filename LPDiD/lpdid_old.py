@@ -95,7 +95,7 @@ def _run_single_regression_ray(
     # Ensure unique fixed effects (avoid duplicates)
     fe_vars = [time] + absorb
     fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data, time)
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data)
     
     # Set up clustering
     if len(cluster_vars) == 1:
@@ -347,7 +347,7 @@ def _run_single_regression_ray_poisson(
     # Ensure unique fixed effects (avoid duplicates)
     fe_vars = [time] + absorb
     fe_vars = list(dict.fromkeys(fe_vars))  # Remove duplicates while preserving order
-    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data, time)
+    formula = _build_regression_formula_standalone('Dy', fe_vars, controls, interact_vars, long_diff_data)
     
     # Set up clustering
     if len(cluster_vars) == 1:
@@ -508,16 +508,12 @@ def _run_single_regression_ray_poisson(
 
 
 # Standalone helper functions for Ray remote function
-def _build_regression_formula_standalone(y_var, fe_vars, controls, interact_vars, data, time):
+def _build_regression_formula_standalone(y_var, fe_vars, controls, interact_vars, data):
     """Standalone version of _build_regression_formula for Ray"""
-    # Build control variables part - always use cntr_ versions
+    # Build control variables part
     if interact_vars:
         # With interactions, we use group-specific treatment variables
-        controls_list = []
-        
-        # Add cntr_ versions of control variables
-        for ctrl in controls:
-            controls_list.append(f"cntr_{ctrl}")
+        controls_list = controls.copy()
         
         # Add group-specific treatment indicators
         for var in interact_vars:
@@ -528,20 +524,12 @@ def _build_regression_formula_standalone(y_var, fe_vars, controls, interact_vars
                 group_name = f"{clean_var}_{val}"
                 controls_list.append(f"D_treat_{group_name}")
     else:
-        # Standard case: use cntr_ versions of controls and add D_treat
-        controls_list = [f"cntr_{ctrl}" for ctrl in controls] + ['D_treat']
-    
-    # Build fixed effects part - use cntr_ versions except for time
-    fe_cntr = []
-    for fe in fe_vars:
-        if fe == time:
-            fe_cntr.append(fe)  # Time variable stays as is
-        else:
-            fe_cntr.append(f"cntr_{fe}")  # Other fixed effects use cntr_ version
+        # Standard case: just add D_treat
+        controls_list = controls + ['D_treat']
     
     # Build formula parts
     controls_str = " + ".join(controls_list) if controls_list else "1"
-    fe_str = " + ".join(fe_cntr) if fe_cntr else ""
+    fe_str = " + ".join(fe_vars) if fe_vars else ""
     
     if fe_str:
         formula = f"{y_var} ~ {controls_str} | {fe_str}"
@@ -1041,10 +1029,6 @@ class LPDiD:
         # Store results for each horizon
         all_results = []
         
-        # Track min_time feature usage
-        min_time_selection_applied = False
-        min_time_controls_applied = False
-        
         # Process POST-treatment horizons (0 to post_window)
         for h in range(self.post_window + 1):
             # Create long difference: y_{t+h} - y_{t-1}
@@ -1067,56 +1051,11 @@ class LPDiD:
                     ((self.data['D_treat'] == 0) & (self.data['never_treated'] == 1))
                 )
             
-            # Apply min_time_selection if specified
-            if self.min_time_selection:
-                # For post-treatment (h >= 0): the earlier period is t-1
-                # We need to evaluate the condition based on values at t-1
-                try:
-                    # Create a temporary mask for the selection condition
-                    # We shift all relevant columns to get their t-1 values
-                    selection_data = self.data.copy()
-                    
-                    # Shift all columns that might be used in the condition
-                    for col in self.data.columns:
-                        if col not in [self.unit, self.time, f'Dy_h{h}', 'D_treat']:
-                            selection_data[f'{col}_at_selection'] = self.data.groupby(self.unit)[col].shift(1)
-                    
-                    # Modify the condition to use shifted column names
-                    import re
-                    modified_condition = self.min_time_selection
-                    for col in self.data.columns:
-                        if col not in [self.unit, self.time, f'Dy_h{h}', 'D_treat'] and f'{col}_at_selection' in selection_data.columns:
-                            # Use word boundaries to ensure we only replace complete variable names
-                            pattern = r'\b' + re.escape(col) + r'\b'
-                            replacement = f'{col}_at_selection'
-                            modified_condition = re.sub(pattern, replacement, modified_condition)
-                    
-                    # Evaluate the modified condition
-                    selection_mask = selection_data.eval(modified_condition)
-                    sample_mask = sample_mask & selection_mask
-                    min_time_selection_applied = True
-                    
-                except Exception as e:
-                    warnings.warn(f"Failed to apply min_time_selection for horizon {h}: {e}")
-            
             # Create horizon data
             horizon_data = self.data[sample_mask].copy()
             horizon_data['Dy'] = horizon_data[f'Dy_h{h}']
             horizon_data['h'] = h
             horizon_data['is_pre'] = 0
-            
-            # Always add cntr_ columns for controls and fixed effects (except time)
-            control_cols = self.controls + [fe for fe in self.absorb if fe != self.time]
-            
-            for col in control_cols:
-                if col in self.data.columns:
-                    # Always add cntr_ columns (shifted if min_time_controls, original otherwise)
-                    if self.min_time_controls:
-                        # For post-treatment: use control values from t-1
-                        horizon_data[f'cntr_{col}'] = self.data.groupby(self.unit)[col].shift(1)[sample_mask].values
-                        min_time_controls_applied = True
-                    else:
-                        horizon_data[f'cntr_{col}'] = horizon_data[col]
             
             # Drop the temporary column
             self.data = self.data.drop(columns=[f'Dy_h{h}'])
@@ -1143,57 +1082,11 @@ class LPDiD:
                     ((self.data['D_treat'] == 0) & (self.data['never_treated'] == 1))
                 )
             
-            # Apply min_time_selection if specified
-            if self.min_time_selection:
-                # For pre-treatment (h < 0): the earlier period is t-h
-                # We need to evaluate the condition based on values at t-h
-                try:
-                    # Create a temporary mask for the selection condition
-                    # We shift all relevant columns to get their t-h values
-                    selection_data = self.data.copy()
-                    
-                    # Shift all columns that might be used in the condition
-                    for col in self.data.columns:
-                        if col not in [self.unit, self.time, f'Dy_h{-h}', 'D_treat']:
-                            selection_data[f'{col}_at_selection'] = self.data.groupby(self.unit)[col].shift(h)
-                    
-                    # Modify the condition to use shifted column names
-                    import re
-                    modified_condition = self.min_time_selection
-                    for col in self.data.columns:
-                        if col not in [self.unit, self.time, f'Dy_h{-h}', 'D_treat'] and f'{col}_at_selection' in selection_data.columns:
-                            # Use word boundaries to ensure we only replace complete variable names
-                            pattern = r'\b' + re.escape(col) + r'\b'
-                            replacement = f'{col}_at_selection'
-                            modified_condition = re.sub(pattern, replacement, modified_condition)
-                    
-                    # Evaluate the modified condition
-                    selection_mask = selection_data.eval(modified_condition)
-                    sample_mask = sample_mask & selection_mask
-                    min_time_selection_applied = True
-                    
-                except Exception as e:
-                    warnings.warn(f"Failed to apply min_time_selection for horizon {-h}: {e}")
-            
             # Create horizon data
             horizon_data = self.data[sample_mask].copy()
             horizon_data['Dy'] = horizon_data[f'Dy_h{-h}']
             horizon_data['h'] = -h  # Negative for pre-treatment
             horizon_data['is_pre'] = 1
-            
-            # Always add cntr_ columns for controls and fixed effects (except time)
-            control_cols = self.controls + [fe for fe in self.absorb if fe != self.time]
-            
-            for col in control_cols:
-                if col in self.data.columns:
-                    # Always add cntr_ columns (shifted if min_time_controls, original otherwise)
-                    if self.min_time_controls:
-                        # For pre-treatment: use control values from t-h
-                        # FIXED: Use shift(h) instead of shift(1)
-                        horizon_data[f'cntr_{col}'] = self.data.groupby(self.unit)[col].shift(h)[sample_mask].values
-                        min_time_controls_applied = True
-                    else:
-                        horizon_data[f'cntr_{col}'] = horizon_data[col]
             
             # Drop the temporary column
             self.data = self.data.drop(columns=[f'Dy_h{-h}'])
@@ -1203,10 +1096,6 @@ class LPDiD:
         # Combine all horizons
         self.long_diff_data = pd.concat(all_results, ignore_index=True)
         
-        # Drop all temporary Dy_h* columns
-        temp_cols = [col for col in self.long_diff_data.columns if col.startswith('Dy_h')]
-        self.long_diff_data = self.long_diff_data.drop(columns=temp_cols)
-
         # Remove any rows with missing Dy values
         initial_count = len(self.long_diff_data)
         self.long_diff_data = self.long_diff_data.dropna(subset=['Dy'])
@@ -1217,56 +1106,248 @@ class LPDiD:
         # Sort by unit, time, and horizon for consistency
         self.long_diff_data = self.long_diff_data.sort_values([self.unit, self.time, 'h'])
         
-        # Keep only relevant columns
-        columns_to_keep = [
-            self.unit,
-            self.time,
-            'h',
-            'D_treat',
-            'Dy',
-            'is_pre'
-        ]
+        print(f"Long differences generation complete. Created {len(self.long_diff_data):,} observations")
+    
+    def _generate_differences_vectorized(self):
+        """Ultra-fast vectorized long difference generation using NumPy"""
+        print("Using optimized NumPy vectorized approach for long differences...")
         
-        # Add control variables and their cntr_ counterparts
-        for col in self.controls:
-            if col in self.long_diff_data.columns:
-                columns_to_keep.append(col)
-            if f'cntr_{col}' in self.long_diff_data.columns:
-                columns_to_keep.append(f'cntr_{col}')
+        # Step 1: Extract arrays for speed
+        units = self.data[self.unit].values
+        y_values = self.data[self.depvar].values
+        n = len(self.data)
         
-        # Add fixed effect variables (except time which is already included) and their cntr_ counterparts
-        for col in self.absorb:
-            if col != self.time and col in self.long_diff_data.columns:
-                columns_to_keep.append(col)
-            if col != self.time and f'cntr_{col}' in self.long_diff_data.columns:
-                columns_to_keep.append(f'cntr_{col}')
+        # Step 2: Find unit boundaries efficiently
+        unit_diff = np.diff(units, prepend=units[0]-1)
+        unit_starts = np.where(unit_diff != 0)[0]
+        unit_ends = np.append(unit_starts[1:], n)
         
-        # Add clustering variables if they're not already included
-        for col in self.cluster_vars:
-            if col not in columns_to_keep and col in self.long_diff_data.columns:
-                columns_to_keep.append(col)
+        # Step 3: Create unit mapping arrays
+        unit_start_map = np.zeros(n, dtype=np.int32)
+        unit_end_map = np.zeros(n, dtype=np.int32)
         
-        # Add weights column if specified
-        if self.weights and self.weights in self.long_diff_data.columns:
-            columns_to_keep.append(self.weights)
+        for i, (start, end) in enumerate(zip(unit_starts, unit_ends)):
+            unit_start_map[start:end] = start
+            unit_end_map[start:end] = end
         
-        # Add interaction variables and their D_treat columns if present
+        # Step 4: Define all horizons
+        horizons = []
+        horizons.extend(range(self.post_window + 1))      # 0 to post_window
+        horizons.extend(range(-self.pre_window, -1))      # -pre_window to -2
+        
+        # Step 5: Vectorized difference calculation
+        n_horizons = len(horizons)
+        long_indices = np.tile(np.arange(n), n_horizons)
+        horizon_indices = np.repeat(horizons, n)
+        
+        # Calculate source indices for t-1 and t+h
+        t_minus_1_indices = long_indices - 1
+        t_plus_h_indices = long_indices + np.repeat(horizons, n)
+        
+        # Step 6: Mask for valid differences
+        valid_mask = (
+            (t_minus_1_indices >= unit_start_map[long_indices]) &
+            (t_plus_h_indices < unit_end_map[long_indices]) &
+            (t_plus_h_indices >= 0) &
+            (t_plus_h_indices < n)
+        )
+        
+        # Step 7: Compute all differences as Y_{t+h} - Y_{t-1}
+        dy = np.full(len(long_indices), np.nan)
+        dy[valid_mask] = y_values[t_plus_h_indices[valid_mask]] - y_values[t_minus_1_indices[valid_mask]]
+        
+        # Step 8: Apply swap_pre_diff logic (just negate for h < 0)
+        if self.swap_pre_diff:
+            pre_mask = horizon_indices < 0
+            dy[pre_mask] = -dy[pre_mask]
+        
+        # Step 9: Calculate control/selection period indices
+        # For post-treatment (h >= 0): use t-1
+        # For pre-treatment (h < 0): use t-h  
+        control_indices = np.where(
+            horizon_indices >= 0,
+            t_minus_1_indices,  # For post-treatment: use t-1
+            long_indices + horizon_indices  # For pre-treatment: use t-h (which is long_indices + negative h)
+        )
+        
+        # Step 10: Apply min_time_selection if specified
+        keep_mask = ~np.isnan(dy)
+        
+        if self.min_time_selection and keep_mask.any():
+            # Count observations before min_time_selection
+            obs_before_selection = keep_mask.sum()
+            
+            # Extract values at selection time for condition evaluation
+            selection_mask = keep_mask.copy()
+            
+            # Get column names that might be used in the condition
+            # Parse the condition to find variable names
+            import ast
+            try:
+                # Create a temporary DataFrame for evaluation
+                # Only include rows where we have valid differences
+                temp_data = {}
+                temp_data[self.unit] = units[long_indices[selection_mask]]
+                temp_data[self.time] = self.data[self.time].values[long_indices[selection_mask]]
+                
+                # Extract all columns that might be in the condition at selection time
+                for col in self.data.columns:
+                    if col not in [self.unit, self.time, 'D_treat'] and col in self.data.columns:
+                        # Get values from the selection period
+                        temp_data[col] = self.data[col].values[control_indices[selection_mask]]
+                
+                # Create temporary DataFrame for evaluation
+                eval_df = pd.DataFrame(temp_data)
+                
+                # Evaluate the condition
+                condition_result = eval_df.eval(self.min_time_selection)
+                
+                # Update the keep_mask based on condition
+                # First, create a full-size mask initialized to False
+                full_condition_mask = np.zeros(len(keep_mask), dtype=bool)
+                # Then set True values where selection_mask is True
+                full_condition_mask[selection_mask] = condition_result.values
+                
+                # Final keep_mask combines valid differences and selection condition
+                keep_mask = keep_mask & full_condition_mask
+                
+                # Count and print how many observations were dropped
+                obs_after_selection = keep_mask.sum()
+                obs_dropped = obs_before_selection - obs_after_selection
+                print(f"Min-time selection applied: {obs_dropped:,} observations dropped ({100*obs_dropped/obs_before_selection:.1f}%)")
+                print(f"  Before: {obs_before_selection:,} observations")
+                print(f"  After: {obs_after_selection:,} observations")
+                
+            except Exception as e:
+                warnings.warn(f"Failed to apply min_time_selection condition '{self.min_time_selection}': {e}")
+        
+        # Step 11: Build result DataFrame (only valid observations)
+        
+        # Build dictionary column by column for efficiency
+        result_dict = {
+            self.unit: self.data[self.unit].values[long_indices[keep_mask]],
+            self.time: self.data[self.time].values[long_indices[keep_mask]],
+            'h': horizon_indices[keep_mask],
+            'Dy': dy[keep_mask],
+            'D_treat': self.data['D_treat'].values[long_indices[keep_mask]],
+            'is_pre': (horizon_indices[keep_mask] < 0).astype(int)
+        }
+        
+        # Add remaining columns with min_time_controls logic
+        essential_cols = self.controls + self.absorb + self.cluster_vars
+        if self.weights:
+            essential_cols.append(self.weights)
+        if 'never_treated' in self.data.columns:
+            essential_cols.append('never_treated')
+        
+        # Parse interaction fixed effects and add constituent variables
+        for fe in self.absorb:
+            if '^' in fe:
+                # Split by ^ to get individual components
+                components = fe.split('^')
+                for component in components:
+                    component = component.strip()
+                    if component and component not in essential_cols:
+                        essential_cols.append(component)
+        
+        # Remove duplicates
+        essential_cols = list(dict.fromkeys(essential_cols))
+        
+        # Determine which columns should use control period values
+        control_period_cols = set()
+        if self.min_time_controls:
+            # Controls and non-time fixed effects should use control period values
+            control_period_cols.update(self.controls)
+            control_period_cols.update([fe for fe in self.absorb if fe != self.time])
+        
+        for col in essential_cols:
+            if col in self.data.columns:
+                if col in control_period_cols:
+                    # Use values from control period
+                    result_dict[col] = self.data[col].values[control_indices[keep_mask]]
+                else:
+                    # Use values from current period
+                    result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+        
+        # Add interaction columns if present
         if self.interact_vars:
+            interaction_cols = [c for c in self.data.columns if c.startswith('D_treat_')]
+            for col in interaction_cols:
+                result_dict[col] = self.data[col].values[long_indices[keep_mask]]
+            
+            # Also add the interaction variables themselves with control period logic if needed
             for var in self.interact_vars:
                 clean_var = var.replace("i.", "") if var.startswith("i.") else var
-                if clean_var in self.long_diff_data.columns and clean_var not in columns_to_keep:
-                    columns_to_keep.append(clean_var)
-                # Add group-specific treatment columns
-                group_cols = [col for col in self.long_diff_data.columns if col.startswith(f'D_treat_{clean_var}_')]
-                columns_to_keep.extend([col for col in group_cols if col not in columns_to_keep])
+                if clean_var in self.data.columns and clean_var not in result_dict:
+                    if self.min_time_controls and clean_var in control_period_cols:
+                        result_dict[clean_var] = self.data[clean_var].values[control_indices[keep_mask]]
+                    else:
+                        result_dict[clean_var] = self.data[clean_var].values[long_indices[keep_mask]]
         
-        # Keep only unique columns in the order they appear
-        columns_to_keep = list(dict.fromkeys(columns_to_keep))
+        # Create final DataFrame
+        self.long_diff_data = pd.DataFrame(result_dict)
         
-        # Filter to keep only relevant columns
-        self.long_diff_data = self.long_diff_data[columns_to_keep]
+        # Apply CCS filtering according to Dube et al. (2023)
+        # Clean Control Sample includes:
+        # 1. Newly treated (D_treat = 1)
+        # 2. Clean controls (units that remain untreated through t+h)
         
-        print(f"Long differences generation complete. Created {len(self.long_diff_data):,} observations")
+        # First, we need to get treatment status at t+h for each observation
+        # We'll merge with original data to get D_{i,t+h}
+        
+        # Create a temporary column for t+h
+        self.long_diff_data['t_plus_h'] = self.long_diff_data[self.time] + self.long_diff_data['h']
+        
+        # Get treatment status at t+h
+        treatment_at_t_plus_h = self.data[[self.unit, self.time, self.treat]].copy()
+        treatment_at_t_plus_h = treatment_at_t_plus_h.rename(columns={
+            self.time: 't_plus_h',
+            self.treat: 'D_at_t_plus_h'
+        })
+        
+        # Merge to get D_{i,t+h}
+        self.long_diff_data = self.long_diff_data.merge(
+            treatment_at_t_plus_h,
+            on=[self.unit, 't_plus_h'],
+            how='left'
+        )
+        
+        # For observations where t+h is beyond the data, assume untreated
+        self.long_diff_data['D_at_t_plus_h'] = self.long_diff_data['D_at_t_plus_h'].fillna(0)
+        
+        # Apply CCS condition: either newly treated OR clean control
+        # Newly treated: D_treat = 1
+        # Clean control: D_treat = 0 AND D_at_t_plus_h = 0
+        self.long_diff_data['CCS'] = (
+            (self.long_diff_data['D_treat'] == 1) |  # Newly treated
+            ((self.long_diff_data['D_treat'] == 0) & (self.long_diff_data['D_at_t_plus_h'] == 0))  # Clean control
+        ).astype(int)
+        
+        # If nevertreated option is specified, further restrict to never-treated controls
+        if self.nevertreated and 'never_treated' in self.long_diff_data.columns:
+            # For controls, also require never_treated = 1
+            self.long_diff_data.loc[
+                self.long_diff_data['D_treat'] == 0, 'CCS'
+            ] = self.long_diff_data.loc[
+                self.long_diff_data['D_treat'] == 0
+            ].apply(
+                lambda x: int(x['CCS'] == 1 and x['never_treated'] == 1), 
+                axis=1
+            )
+        
+        # Apply CCS filtering to keep only clean control samples
+        print(f"Applying CCS filtering...")
+        pre_filter_count = len(self.long_diff_data)
+        self.long_diff_data = self.long_diff_data[self.long_diff_data['CCS'] == 1].copy()
+        post_filter_count = len(self.long_diff_data)
+        print(f"CCS filtering complete. Kept {post_filter_count:,} of {pre_filter_count:,} observations " 
+              f"({100*post_filter_count/pre_filter_count:.1f}%)")
+        
+        # Drop temporary columns used for CCS filtering
+        columns_to_drop = ['CCS', 't_plus_h', 'D_at_t_plus_h']
+        self.long_diff_data = self.long_diff_data.drop(columns=[col for col in columns_to_drop if col in self.long_diff_data.columns])
+    
+
     def _compute_weights(self):
         """Compute weights for reweighted estimation"""
         if self.rw:
@@ -1277,14 +1358,10 @@ class LPDiD:
 
     def _build_regression_formula(self, y_var: str, fe_vars: List[str]) -> str:
         """Build regression formula with potential interactions"""
-        # Build control variables part - always use cntr_ versions
+        # Build control variables part
         if self.interact_vars:
             # With interactions, we use group-specific treatment variables
-            controls = []
-            
-            # Add cntr_ versions of control variables
-            for ctrl in self.controls:
-                controls.append(f"cntr_{ctrl}")
+            controls = self.controls.copy()
             
             # Add group-specific treatment indicators
             for var in self.interact_vars:
@@ -1295,20 +1372,12 @@ class LPDiD:
                     group_name = f"{clean_var}_{val}"
                     controls.append(f"D_treat_{group_name}")
         else:
-            # Standard case: use cntr_ versions of controls and add D_treat
-            controls = [f"cntr_{ctrl}" for ctrl in self.controls] + ['D_treat']
-        
-        # Build fixed effects part - use cntr_ versions except for time
-        fe_cntr = []
-        for fe in fe_vars:
-            if fe == self.time:
-                fe_cntr.append(fe)  # Time variable stays as is
-            else:
-                fe_cntr.append(f"cntr_{fe}")  # Other fixed effects use cntr_ version
+            # Standard case: just add D_treat
+            controls = self.controls + ['D_treat']
         
         # Build formula parts
         controls_str = " + ".join(controls) if controls else "1"
-        fe_str = " + ".join(fe_cntr) if fe_cntr else ""
+        fe_str = " + ".join(fe_vars) if fe_vars else ""
         
         if fe_str:
             formula = f"{y_var} ~ {controls_str} | {fe_str}"
@@ -1316,6 +1385,126 @@ class LPDiD:
             formula = f"{y_var} ~ {controls_str}"
         
         return formula
+
+    def _apply_min_time_selection(self, reg_data, horizon, is_pre=False):
+        """Apply min_time_selection filter to regression data
+        
+        Selection is based on the earlier of the two periods in the long-difference:
+        - For post-treatment (t-1 to t+h): use t-1
+        - For pre-treatment (t-h to t-1): use t-h
+        """
+        if not self.min_time_selection:
+            return reg_data
+        
+        # Determine the selection period (earlier of the two periods in long-difference)
+        if is_pre:
+            # For pre-treatment: difference is between t-h and t-1, so use t-h
+            selection_shift = horizon
+        else:
+            # For post-treatment: difference is between t-1 and t+h, so use t-1
+            selection_shift = 1
+        
+        # Create a time variable that accounts for the selection period
+        reg_data['selection_time'] = reg_data[self.time] - selection_shift
+        
+        # Merge with original data to get the condition values at selection time
+        selection_data = self.data[[self.unit, self.time] + [col for col in self.data.columns 
+                                                            if col not in [self.unit, self.time]]].copy()
+        selection_data = selection_data.rename(columns={self.time: 'selection_time'})
+        
+        # Merge to get values at selection time
+        reg_data = reg_data.merge(
+            selection_data[[self.unit, 'selection_time'] + [col for col in selection_data.columns 
+                                                           if col not in [self.unit, 'selection_time', 'D_treat']]],
+            on=[self.unit, 'selection_time'],
+            how='left',
+            suffixes=('', '_selection')
+        )
+        
+        # Apply the selection condition using values at selection time
+        try:
+            # Replace variable names in the condition with their selection-time values
+            # Use regex to ensure we only replace whole words, not parts of words
+            import re
+            condition = self.min_time_selection
+            for col in self.data.columns:
+                if col not in [self.unit, self.time, 'D_treat'] and f'{col}_selection' in reg_data.columns:
+                    # Use word boundaries to ensure we only replace complete variable names
+                    pattern = r'\b' + re.escape(col) + r'\b'
+                    replacement = f'{col}_selection'
+                    condition = re.sub(pattern, replacement, condition)
+            
+            # Evaluate the condition
+            mask = reg_data.eval(condition)
+            reg_data = reg_data[mask]
+        except Exception as e:
+            warnings.warn(f"Failed to apply min_time_selection condition '{self.min_time_selection}': {e}")
+        
+        # Clean up temporary columns
+        selection_cols = [col for col in reg_data.columns if col.endswith('_selection')]
+        reg_data = reg_data.drop(columns=selection_cols + ['selection_time'])
+        
+        return reg_data
+
+    def _apply_min_time_controls(self, reg_data, horizon, is_pre=False):
+        """Apply min_time_controls logic to use control variables from the earlier period
+        
+        When min_time_controls=True, control variables are drawn from the earlier
+        of the two periods in the long-difference:
+        - For post-treatment (t-1 to t+h): controls from t-1
+        - For pre-treatment (t-h to t-1): controls from t-h
+        """
+        if not self.min_time_controls:
+            return reg_data
+        
+        # Determine the control period (earlier of the two periods in long-difference)
+        if is_pre:
+            # For pre-treatment: difference is between t-h and t-1, so use t-h
+            control_shift = horizon
+        else:
+            # For post-treatment: difference is between t-1 and t+h, so use t-1
+            control_shift = 1
+        
+        # Create a time variable that accounts for the control period
+        reg_data['control_time'] = reg_data[self.time] - control_shift
+        
+        # Get list of all control variables and fixed effects to shift
+        vars_to_shift = self.controls.copy()
+        
+        # Also handle fixed effects that aren't time-based
+        fe_vars_to_shift = [fe for fe in self.absorb if fe != self.time]
+        vars_to_shift.extend(fe_vars_to_shift)
+        
+        # Only proceed if there are variables to shift
+        if vars_to_shift:
+            # Merge with original data to get the control values at control time
+            control_cols = [self.unit, self.time] + vars_to_shift
+            # Filter to only include columns that exist in the data
+            control_cols = [col for col in control_cols if col in self.data.columns]
+            
+            control_data = self.data[control_cols].copy()
+            control_data = control_data.rename(columns={self.time: 'control_time'})
+            
+            # Merge to get values at control time
+            reg_data = reg_data.merge(
+                control_data,
+                on=[self.unit, 'control_time'],
+                how='left',
+                suffixes=('_current', '_control')
+            )
+            
+            # Replace current values with control period values
+            for var in vars_to_shift:
+                if f'{var}_control' in reg_data.columns:
+                    reg_data[var] = reg_data[f'{var}_control']
+                    reg_data = reg_data.drop(columns=[f'{var}_control'])
+                if f'{var}_current' in reg_data.columns:
+                    reg_data = reg_data.drop(columns=[f'{var}_current'])
+        
+        # Clean up control_time column
+        reg_data = reg_data.drop(columns=['control_time'])
+        
+        return reg_data
 
     def _run_single_regression(self, horizon, is_pre=False):
         """
@@ -1648,16 +1837,13 @@ class LPDiD:
                 print("Ray initialized.")
             
             try:
-                # Put the long_diff_data in Ray's object store for shared memory access
-                long_diff_data_ref = ray.put(self.long_diff_data)
-                
                 # Submit all regression tasks to Ray
                 ray_futures = []
                 for h, is_pre in regression_tasks:
                     future = _run_single_regression_ray.remote(
                         horizon=h,
                         is_pre=is_pre,
-                        long_diff_data=long_diff_data_ref,  # Pass reference instead of data
+                        long_diff_data=self.long_diff_data,
                         depvar=self.depvar,
                         time=self.time,
                         controls=self.controls,
@@ -2001,16 +2187,13 @@ class LPDiDPois(LPDiD):
                 print("Ray initialized.")
             
             try:
-                # Put the long_diff_data in Ray's object store for shared memory access
-                long_diff_data_ref = ray.put(self.long_diff_data)
-                
                 # Submit all regression tasks to Ray
                 ray_futures = []
                 for h, is_pre in regression_tasks:
                     future = _run_single_regression_ray_poisson.remote(
                         horizon=h,
                         is_pre=is_pre,
-                        long_diff_data=long_diff_data_ref,  # Pass reference instead of data
+                        long_diff_data=self.long_diff_data,
                         depvar=self.depvar,
                         time=self.time,
                         controls=self.controls,
