@@ -126,7 +126,10 @@ def _run_single_regression_ray(
                 weights=use_weights,
                 vcov=vcov,
                 lean=lean,
-                copy_data=copy_data
+                copy_data=copy_data,
+                fixef_maxiter=200000,
+                fixef_tol=1e-4,
+                demeaner_backend="rust"
             )
         else:
             fit = pf.feols(
@@ -134,7 +137,10 @@ def _run_single_regression_ray(
                 data=reg_data,
                 vcov=vcov,
                 lean=lean,
-                copy_data=copy_data
+                copy_data=copy_data,
+                fixef_maxiter=200000,
+                fixef_tol=1e-4,
+                demeaner_backend="rust"
             )
         
         nobs = fit._N
@@ -382,7 +388,10 @@ def _run_single_regression_ray_poisson(
                 weights=use_weights,
                 vcov=vcov,
                 lean=lean,
-                copy_data=copy_data
+                copy_data=copy_data,
+                fixef_maxiter=200000,
+                fixef_tol=1e-4,
+                demeaner_backend="rust"
             )
         else:
             fit = pf.fepois(
@@ -390,7 +399,10 @@ def _run_single_regression_ray_poisson(
                 data=reg_data,
                 vcov=vcov,
                 lean=lean,
-                copy_data=copy_data
+                copy_data=copy_data,
+                fixef_maxiter=200000,
+                fixef_tol=1e-4,
+                demeaner_backend="rust"
             )
         
         nobs = fit._N
@@ -1384,7 +1396,10 @@ class LPDiD:
                     weights=use_weights,
                     vcov=vcov,
                     lean=self.lean,
-                    copy_data=self.copy_data
+                    copy_data=self.copy_data,
+                    fixef_maxiter=200000,
+                    fixef_tol=1e-4,
+                    demeaner_backend="rust"
                 )
             else:
                 fit = pf.feols(
@@ -1392,7 +1407,10 @@ class LPDiD:
                     data=reg_data,
                     vcov=vcov,
                     lean=self.lean,
-                    copy_data=self.copy_data
+                    copy_data=self.copy_data,
+                    fixef_maxiter=200000,
+                    fixef_tol=1e-4,
+                    demeaner_backend="rust"
                 )
             
             nobs = fit._N
@@ -2160,7 +2178,10 @@ class LPDiDPois(LPDiD):
                     weights=use_weights,
                     vcov=vcov,
                     lean=self.lean,
-                    copy_data=self.copy_data
+                    copy_data=self.copy_data,
+                    fixef_maxiter=200000,
+                    fixef_tol=1e-4,
+                    demeaner_backend="rust"
                 )
             else:
                 fit = pf.fepois(
@@ -2168,7 +2189,10 @@ class LPDiDPois(LPDiD):
                     data=reg_data,
                     vcov=vcov,
                     lean=self.lean,
-                    copy_data=self.copy_data
+                    copy_data=self.copy_data,
+                    fixef_maxiter=200000,
+                    fixef_tol=1e-4,
+                    demeaner_backend="rust"
                 )
             
             nobs = fit._N
